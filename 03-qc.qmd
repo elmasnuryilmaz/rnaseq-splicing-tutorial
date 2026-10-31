@@ -1,0 +1,336 @@
+# Quality control, PCA and batch {#sec-qc}
+
+Quality control answers one question: **can we trust the comparison we are
+about to make?** We look for failed libraries, check that the knockdown
+worked, and find out which factors drive the largest differences between
+samples. In particular, we want to know how big the batch effect is compared
+with the effect of TDP-43 knockdown.
+
+```{r}
+#| label: setup
+source("R/helpers.R")
+suppressPackageStartupMessages({
+  library(DESeq2)
+  library(ggplot2)
+  library(pheatmap)
+  library(dplyr)
+  library(tidyr)
+})
+rse <- load_counts_rse()
+samples <- as.data.frame(colData(rse)[, c("sirna", "batch", "replicate")])
+samples$run <- colnames(rse)
+```
+
+## Library size and alignment
+
+recount3 ships the STAR alignment statistics for every run. A failed
+library usually shows up here first: very few reads, a low unique mapping
+rate, or a very high mitochondrial fraction.
+
+```{r}
+#| label: fig-libsize
+#| fig-cap: "Read pairs per run (bars) and the share that STAR mapped uniquely (label). Colour shows the siRNA, facets show the batch."
+#| fig-width: 9
+#| fig-height: 4
+cd <- colData(rse)
+qc <- data.frame(
+  run = colnames(rse), sirna = cd$sirna, batch = cd$batch,
+  read_pairs = as.numeric(cd$sra.num_spots),
+  unique_pct = as.numeric(cd$`recount_qc.star.uniquely_mapped_reads_%_both`),
+  chrM_pct = as.numeric(cd$`recount_qc.aligned_reads%.chrm`),
+  gene_assigned_pct = as.numeric(cd$`recount_qc.gene_fc.all_%`)
+)
+ggplot(qc, aes(reorder(run, as.integer(sirna)), read_pairs / 1e6, fill = sirna)) +
+  geom_col() +
+  geom_text(aes(label = round(unique_pct)), vjust = -0.3, size = 3) +
+  facet_grid(~ batch, scales = "free_x", space = "free_x") +
+  scale_fill_manual(values = SIRNA_COLS) +
+  labs(x = NULL, y = "Read pairs (millions)", fill = "siRNA") +
+  theme_tutorial() +
+  theme(axis.text.x = element_text(angle = 60, hjust = 1, size = 8))
+```
+
+```{r}
+#| label: qc-by-batch
+qc |>
+  group_by(batch) |>
+  summarise(n = n(),
+            median_pairs_M = median(read_pairs) / 1e6,
+            median_unique_pct = median(unique_pct),
+            median_chrM_pct = median(chrM_pct),
+            median_gene_assigned_pct = median(gene_assigned_pct))
+```
+
+All libraries map well (more than 94% of read pairs uniquely mapped) and
+none looks like a failure. The clearest difference is **depth**: B1 runs have roughly twice as
+many read pairs as B2 runs. Depth is handled by normalisation, but it is our
+first hint that the two batches were not processed identically.
+
+## Filtering and transformation
+
+Raw counts are not suitable for distance-based methods like PCA: the
+variance of a count grows with its mean, so a few highly expressed genes
+would dominate. DESeq2's variance stabilising transformation (VST) puts the
+data on a log2-like scale where the variance is roughly constant
+[@love2014].
+
+We first drop genes that are too lowly expressed to be informative, with
+the rule used throughout the book: **at least 10 counts in at least as many
+samples as the smallest group**. Here we look at all four groups, and the
+smallest has 3 samples.
+
+```{r}
+#| label: filter
+dds_all <- DESeqDataSet(rse, design = ~ batch + sirna)
+min_group <- min(table(dds_all$sirna))
+keep <- rowSums(counts(dds_all) >= 10) >= min_group
+dds_all <- dds_all[keep, ]
+c(min_group_size = min_group, genes_kept = sum(keep), genes_total = length(keep))
+```
+
+```{r}
+#| label: vst
+# blind = TRUE: the transformation ignores the design, which is what we want
+# for an unbiased first look at the data.
+vsd_all <- vst(dds_all, blind = TRUE)
+```
+
+## Did the knockdown work?
+
+Before anything else, check the target. If *TARDBP* is not reduced, nothing
+downstream is interpretable.
+
+```{r}
+#| label: fig-tardbp
+#| fig-cap: "Normalised counts of TARDBP (TDP-43) and of STMN2, a known TDP-43 target, in every sample."
+#| fig-width: 8
+#| fig-height: 3.5
+dds_all <- estimateSizeFactors(dds_all)
+sym <- rowData(dds_all)$gene_name
+genes <- c("TARDBP", "STMN2")
+norm <- counts(dds_all, normalized = TRUE)[match(genes, sym), ]
+rownames(norm) <- genes
+as.data.frame(t(norm)) |>
+  mutate(run = colnames(dds_all), sirna = dds_all$sirna, batch = dds_all$batch) |>
+  pivot_longer(all_of(genes), names_to = "gene", values_to = "count") |>
+  ggplot(aes(sirna, count, colour = sirna, shape = batch)) +
+  geom_point(size = 2.5, position = position_jitter(width = 0.15, seed = 1)) +
+  facet_wrap(~ gene, scales = "free_y") +
+  scale_colour_manual(values = SIRNA_COLS, guide = "none") +
+  expand_limits(y = 0) +
+  labs(x = NULL, y = "Normalised count") +
+  theme_tutorial()
+```
+
+```{r}
+#| label: kd-efficiency
+kd_eff <- tapply(norm["TARDBP", ], dds_all$sirna, mean)
+round(kd_eff)
+round(100 * (1 - kd_eff["TDP43"] / kd_eff["scramble"]))
+```
+
+*TARDBP* mRNA is about `r round(100 * (1 - kd_eff["TDP43"] / kd_eff["scramble"]))`%
+lower in the knockdown than in scramble, in both batches. A partial
+knockdown is typical for siRNA. Note that mRNA level is not protein level;
+the original study measured the protein, but RNA-seq alone cannot. *STMN2*,
+one of the best known TDP-43 targets, is also lower, which is a first sign
+that the knockdown had functional consequences in these cells.
+
+## Principal component analysis
+
+PCA finds the directions of largest variation among samples. We use the 500
+most variable genes after VST, a common default.
+
+```{r}
+#| label: pca-function
+pca_data <- function(mat, ntop = 500) {
+  rv <- apply(mat, 1, var)
+  top <- order(rv, decreasing = TRUE)[seq_len(min(ntop, length(rv)))]
+  pc <- prcomp(t(mat[top, ]))
+  list(x = as.data.frame(pc$x[, 1:4]),
+       var = round(100 * pc$sdev^2 / sum(pc$sdev^2), 1))
+}
+```
+
+```{r}
+#| label: fig-pca
+#| fig-cap: "PCA of all 18 samples (VST, 500 most variable genes). Colour shows the siRNA, shape shows the batch."
+#| fig-width: 6.5
+#| fig-height: 4.5
+p <- pca_data(assay(vsd_all))
+pdat <- cbind(p$x, as.data.frame(colData(vsd_all)[, c("sirna", "batch")]))
+ggplot(pdat, aes(PC1, PC2, colour = sirna, shape = batch)) +
+  geom_point(size = 3) +
+  scale_colour_manual(values = SIRNA_COLS) +
+  labs(x = paste0("PC1 (", p$var[1], "%)"), y = paste0("PC2 (", p$var[2], "%)"),
+       colour = "siRNA", shape = "Batch") +
+  theme_tutorial()
+```
+
+Which factor does each principal component follow? A quick way to put a
+number on it is the R² of a linear model of each PC on batch or on siRNA
+group.
+
+```{r}
+#| label: pc-r2
+r2 <- function(pc, f) summary(lm(pc ~ f))$r.squared
+sapply(paste0("PC", 1:4), function(k)
+  c(variance_pct = p$var[as.integer(sub("PC", "", k))],
+    R2_batch = r2(pdat[[k]], pdat$batch),
+    R2_sirna = r2(pdat[[k]], pdat$sirna))) |> round(2)
+```
+
+Read the plot and the table together:
+
+- **PC1 separates the two batches.** It carries 63% of the variance and
+  batch explains almost all of it (R² close to 0.9). The batch effect is
+  the largest single source of variation in this data set.
+- **The siRNA groups are spread over PC2 to PC4**, and within each batch the
+  knockdown samples tend to sit apart from the controls, but no single
+  component cleanly separates knockdown from control while batch dominates.
+
+This is exactly why the design table in @sec-design mattered: because the
+groups are balanced across batches, the batch effect can be modelled.
+
+## Sample correlation heatmap
+
+A correlation heatmap shows the same structure from another angle: every
+sample against every other.
+
+```{r}
+#| label: fig-corr
+#| fig-cap: "Pearson correlation between samples (VST values of all filtered genes), clustered hierarchically."
+#| fig-width: 8
+#| fig-height: 6.5
+cors <- cor(assay(vsd_all), method = "pearson")
+ann <- as.data.frame(colData(vsd_all)[, c("sirna", "batch")])
+pheatmap(cors, annotation_col = ann, annotation_row = ann,
+         annotation_colors = list(sirna = SIRNA_COLS,
+                                  batch = c(B1 = "grey30", B2 = "grey80")),
+         show_colnames = FALSE, fontsize_row = 7,
+         color = colorRampPalette(c("white", "#1f5f8b"))(50))
+```
+
+All correlations are very high (above 0.97), which is normal for samples of
+one cell type; what matters is the clustering. The samples split first by
+batch. Within B2, the four knockdown samples form their own branch, the
+fluorescent-siRNA pair clusters together, and the untransfected pair clusters
+with two of the scramble samples.
+
+## Looking past the batch effect
+
+To see the knockdown effect more clearly, we can remove the batch effect
+**for visualisation only** with `limma::removeBatchEffect()`
+[@ritchie2015]. We give it the design for the biology we want to keep, so
+that it does not remove group differences that happen to correlate with
+batch.
+
+```{r}
+#| label: fig-pca-corrected
+#| fig-cap: "PCA after removing the batch effect from the VST values (for display only)."
+#| fig-width: 6.5
+#| fig-height: 4.5
+mat <- limma::removeBatchEffect(assay(vsd_all), batch = vsd_all$batch,
+                                design = model.matrix(~ sirna, colData(vsd_all)))
+p2 <- pca_data(mat)
+pdat2 <- cbind(p2$x, as.data.frame(colData(vsd_all)[, c("sirna", "batch")]))
+ggplot(pdat2, aes(PC1, PC2, colour = sirna, shape = batch)) +
+  geom_point(size = 3) +
+  scale_colour_manual(values = SIRNA_COLS) +
+  labs(x = paste0("PC1 (", p2$var[1], "%)"), y = paste0("PC2 (", p2$var[2], "%)"),
+       colour = "siRNA", shape = "Batch") +
+  theme_tutorial()
+```
+
+```{r}
+#| label: pc2-check
+with(pdat2, round(c(highest_PC2_knockdown = max(PC2[sirna == "TDP43"]),
+                    lowest_PC2_scramble_or_fluorescent = min(PC2[sirna %in% c("scramble", "fluorescent")])), 1))
+```
+
+After batch correction, the knockdown samples separate from the scramble
+and fluorescent controls, along PC1 and PC2 together: every knockdown sample
+has a lower PC2 value than every scramble and fluorescent sample. Two
+further details are worth noticing:
+
+- The knockdown samples are spread along PC1: three of them move much
+  further from the controls than the other three, even though their
+  *TARDBP* levels look similar. Response heterogeneity between cultures is
+  normal and is exactly what replicates are for.
+- The two untransfected (none) samples from B2 sit apart from all
+  transfected samples at the bottom of the plot. Transfection itself changes the transcriptome a
+  little, which confirms that scramble siRNA, not "no siRNA", is the right
+  control for the knockdown.
+
+::: {.callout-warning}
+## Never run DE on batch-corrected values
+`removeBatchEffect()` returns adjusted log-scale values. Feeding them to a
+DE test would treat the correction as if it were data and give
+over-confident p-values. For DE we put `batch` in the model instead
+(`~ batch + condition`, @sec-de), so the uncertainty of the batch estimate
+is accounted for.
+:::
+
+## Other covariates
+
+The metadata contain no per-sample RIN or differentiation efficiency. The
+protocol only says that all libraries had RIN above 7.5. Sex is easy to check
+from the data themselves, using *XIST* (expressed from the inactive X in
+female cells) and genes on the Y chromosome:
+
+```{r}
+#| label: sex-check
+sex_genes <- c("XIST", "RPS4Y1", "DDX3Y", "KDM5D")
+raw <- counts(DESeqDataSet(rse, design = ~ 1))
+lib_m <- colSums(raw) / 1e6
+cpm_sex <- sapply(sex_genes, function(g) raw[which(rowData(rse)$gene_name == g)[1], ] / lib_m)
+round(apply(cpm_sex, 2, range), 1)
+```
+
+*XIST* is essentially absent and the Y-linked genes are expressed in every
+sample, so all 18 samples come from a male cell line, and sex does not need a
+covariate. A sample that disagreed would point to a sample swap. If your own
+data have covariates, check them the same way as batch: colour the PCA by
+each one and compute the R² with the leading PCs.
+
+```{r}
+#| label: save-qc
+saveRDS(dds_all, cache_path("dds_all_18_samples.rds"))
+```
+
+## Decisions for the next chapters
+
+| Question | Answer from QC | Consequence |
+|---|---|---|
+| Failed libraries? | None | Keep all samples |
+| Knockdown worked? | *TARDBP* reduced in every knockdown sample | Proceed |
+| Largest source of variation | Batch (PC1) | Model it: `~ batch + condition` |
+| Controls behave alike? | Scramble and fluorescent alike; untransfected slightly apart | Scramble is the right control |
+| Sex | All samples male (Y genes on, *XIST* off) | No covariate needed |
+| Confounding? | No, balanced design | Batch effect is estimable |
+
+::: {.callout-tip}
+## Check your understanding
+1. Why do we run PCA on VST values rather than on raw or normalised counts?
+2. PC1 separates the batches. Does that mean the data are unusable?
+3. Why is `blind = TRUE` appropriate for QC, and when would you use
+   `blind = FALSE`?
+4. A labmate suggests running DESeq2 on the output of
+   `removeBatchEffect()`. What do you answer?
+
+::: {.callout-note collapse="true"}
+## Answers
+1. Counts have variance that grows with the mean, so distances would be
+   dominated by a few highly expressed genes. VST makes the variance roughly
+   independent of the mean.
+2. No. Batch effects are common. They are a problem when they are confounded
+   with the biology or ignored. Here the design is balanced and we model the
+   batch.
+3. `blind = TRUE` ignores the design, so the QC view is not shaped by what we
+   expect to see. `blind = FALSE` uses the design to estimate the dispersion
+   trend, which is preferable for downstream plots such as heatmaps when
+   large group differences exist.
+4. Do not. Corrected values are not counts, and the test would ignore the
+   uncertainty of the correction. Include batch in the design formula.
+:::
+:::

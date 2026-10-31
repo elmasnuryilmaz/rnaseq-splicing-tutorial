@@ -1,0 +1,258 @@
+# Strandedness: measure it, do not assume it {#sec-strand}
+
+Most RNA-seq libraries made today are **strand-specific**: the orientation of
+a read tells you which DNA strand the RNA was transcribed from. Older kits,
+including the TruSeq RNA v2 kit used in our study, are usually
+**unstranded**: a read and its reverse complement are equally likely.
+
+Every tool that counts or compares reads needs to know which case it is
+dealing with, and the settings have different names in each tool. A wrong
+setting does not produce an error message. It produces wrong numbers.
+
+## Why it matters
+
+| If the library is... | ...and you tell the tool... | What happens |
+|---|---|---|
+| reverse-stranded (dUTP, e.g. TruSeq Stranded) | unstranded | reads from antisense transcripts are counted for the sense gene, and the reverse; overlapping genes on opposite strands become ambiguous |
+| reverse-stranded | forward-stranded | almost all reads are assigned to the wrong strand, so counts collapse to a few percent of the library |
+| unstranded | either stranded setting | about half of the reads are thrown away, at random with respect to the gene |
+
+The third row is the one that applies to us if we guess wrong. It would not
+create false positives on its own, but it halves the depth and makes
+splicing estimates noisier.
+
+## How to measure it
+
+You need aligned reads and a gene model with known strands. Two quick
+methods:
+
+1. **RSeQC `infer_experiment.py`** [@wang2012] samples reads that overlap
+   genes and reports which fraction of them has each orientation relative
+   to the gene. For paired-end data the two possible patterns are written
+   as `1++,1--,2+-,2-+` (read 1 on the same strand as the gene) and
+   `1+-,1-+,2++,2--` (read 1 on the opposite strand).
+2. **featureCounts `-s 0/1/2`** [@liao2014]: count the same BAM files three
+   times, once as unstranded (`-s 0`), once as forward-stranded (`-s 1`) and
+   once as reverse-stranded (`-s 2`), and compare the fraction of
+   fragments that get assigned.
+
+Expected patterns:
+
+| Library | infer_experiment: `1++,1--,2+-,2-+` | infer_experiment: `1+-,1-+,2++,2--` | featureCounts assigned |
+|---|---|---|---|
+| Unstranded | about 0.5 | about 0.5 | `-s 0` highest; `-s 1` and `-s 2` each about half |
+| Forward-stranded | close to 1 | close to 0 | `-s 0` and `-s 1` high, `-s 2` very low |
+| Reverse-stranded (dUTP) | close to 0 | close to 1 | `-s 0` and `-s 2` high, `-s 1` very low |
+
+## One fact, three spellings
+
+Once measured, the same fact must be given to every tool, in that tool's own
+vocabulary:
+
+| Library | featureCounts `-s` | HISAT2 `--rna-strandness` (paired / single) | rMATS `--libType` |
+|---|---|---|---|
+| Unstranded | `0` | not set | `fr-unstranded` |
+| Forward-stranded (read 1 = sense) | `1` | `FR` / `F` | `fr-secondstrand` |
+| Reverse-stranded (read 1 = antisense, dUTP) | `2` | `RF` / `R` | `fr-firststrand` |
+
+Write the measured value once, in a project configuration file, and read it
+from there in every script. That is how the three settings stay in
+agreement.
+
+## A small demo data set
+
+recount3 gives us counts, not reads, so to measure strandedness we need a
+few aligned reads. Aligning whole samples would cost hours and a full genome
+index. Instead, `scripts/make_demo_data.sh` builds a demo data set from six
+samples of our study (three TDP-43 knockdown and three scramble samples, all
+from batch B2) for a panel of 17 genes:
+
+1. It subsets the GENCODE v26 GTF to the gene panel
+   (`scripts/demo_genes.txt`) and builds a HISAT2 [@kim2019] index of GRCh38
+   in which everything except these genes (plus 10 kb on each side) is
+   masked with N. The index is tiny, and alignments keep real GRCh38
+   coordinates.
+2. It streams **only the reads of those genes** from the public copy of SRA
+   on AWS, aligns them with HISAT2, and keeps properly paired, uniquely
+   aligned reads with at most 3 mismatches.
+
+::: {.callout-important}
+## The first N reads of a file are not a random sample
+The obvious shortcut, "take the first few million reads of each run", fails
+here. The submitters uploaded coordinate-sorted BAM files, and SRA keeps the
+reads in that order (with the alignments removed). The first 6 million read
+pairs of a run therefore all come from the start of chromosome 1. We found
+this out when a test run produced thousands of reads for *AGRN* (near the
+start of chromosome 1) and almost none for *GAPDH* or *ACTB*.
+
+The same ordering is also an opportunity: the reads of one gene sit in one
+contiguous block of the file. `scripts/locate_spot_ranges.R` estimates where
+each block starts from the recount3 coverage files, and
+`scripts/fetch_locus_reads.py` streams a window around it, widening the
+window automatically if the gene's reads reach its edge.
+:::
+
+How good were the estimates? The script logs, for every sample and gene,
+the predicted and the observed position of the block.
+
+```{r}
+#| label: setup
+source("R/helpers.R")
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+})
+samples <- read.csv("results/sample_sheet.csv")
+blocks <- read.delim("data/demo/align/spot_blocks.tsv")
+blocks |>
+  mutate(error_spots = obs_first_spot - est_first_spot) |>
+  group_by(run) |>
+  summarise(genes = n(), reads_kept = sum(reads_in_locus),
+            median_abs_error = median(abs(error_spots)),
+            max_abs_error = max(abs(error_spots)),
+            spots_streamed = sum(window_hi - window_lo + 1)) |>
+  left_join(select(samples, run, sirna, read_pairs), by = "run") |>
+  mutate(fraction_of_run_streamed = round(spots_streamed / read_pairs, 2)) |>
+  knitr::kable(row.names = FALSE)
+```
+
+The estimate is typically within one or two hundred thousand read pairs of
+the true position, and only a minority of each run had to be streamed.
+(Windows of neighbouring genes can overlap, so the true fraction is a little
+lower than shown.)
+
+The core of the per-sample commands, for one window of spots:
+
+```bash
+# Stream spots lo..hi of one run (paired reads in two FASTQ files)
+fastq-dump -N "$lo" -X "$hi" --split-files -O tmp \
+  https://sra-pub-run-odp.s3.amazonaws.com/sra/SRR8083874/SRR8083874
+
+# Align. No --rna-strandness: the library is unstranded (measured below).
+# --no-softclip keeps all reads at 76 bp, which rMATS expects (chapter 8).
+hisat2 -p 4 --no-softclip -x work/demo/ref/idx \
+  -1 tmp/SRR8083874_1.fastq -2 tmp/SRR8083874_2.fastq |
+  samtools view -u -f 2 -q 60 -e '[NM] <= 3' - |
+  samtools sort -o locus.bam -
+```
+
+## Measuring with RSeQC
+
+```bash
+infer_experiment.py -r work/demo/ref/panel.bed12 -i work/demo/bam/SRR8083874.bam -s 200000
+```
+
+```{r}
+#| label: infer
+read_infer <- function(f) {
+  x <- readLines(f)
+  num <- function(pattern) as.numeric(sub(".*: ", "", grep(pattern, x, value = TRUE, fixed = TRUE)))
+  data.frame(run = sub("\\..*", "", basename(f)),
+             failed = num("failed to determine"),
+             sense_1pp = num('"1++,1--,2+-,2-+"'),
+             antisense_1pm = num('"1+-,1-+,2++,2--"'))
+}
+infer <- do.call(rbind, lapply(list.files("data/demo/strandedness", "infer_experiment",
+                                          full.names = TRUE), read_infer))
+infer |>
+  left_join(select(samples, run, sirna), by = "run") |>
+  rename("same strand (1++,1&#45;&#45;,2+-,2-+)" = sense_1pp,
+         "opposite strand (1+-,1-+,2++,2&#45;&#45;)" = antisense_1pm) |>
+  knitr::kable(row.names = FALSE, digits = 3)
+```
+
+In every sample the two orientations are about equally frequent. That is
+the signature of an **unstranded** library.
+
+## Measuring with featureCounts
+
+```bash
+for s in 0 1 2; do
+  featureCounts -T 4 -p --countReadPairs -t exon -g gene_id -s $s \
+    -a work/demo/ref/panel.gtf -o featureCounts_s$s.txt work/demo/bam/*.bam
+done
+```
+
+```{r}
+#| label: fig-featurecounts
+#| fig-cap: "Fraction of read pairs assigned to a gene by featureCounts with each strandedness setting, per sample."
+#| fig-width: 7
+#| fig-height: 3.5
+read_summary <- function(s) {
+  x <- read.delim(sprintf("data/demo/strandedness/featureCounts_s%d.summary", s), check.names = FALSE)
+  long <- pivot_longer(x, -Status, names_to = "bam", values_to = "n")
+  long |>
+    group_by(bam) |>
+    summarise(assigned = n[Status == "Assigned"], total = sum(n)) |>
+    mutate(setting = paste0("-s ", s), run = sub("\\.bam$", "", basename(bam)))
+}
+fc <- bind_rows(lapply(0:2, read_summary)) |>
+  mutate(fraction = assigned / total) |>
+  left_join(select(samples, run, sirna), by = "run")
+ggplot(fc, aes(setting, fraction, colour = sirna, group = run)) +
+  geom_line(alpha = 0.5) +
+  geom_point(size = 2.5) +
+  scale_colour_manual(values = SIRNA_COLS) +
+  scale_y_continuous(limits = c(0, 1)) +
+  labs(x = "featureCounts strandedness setting", y = "Fraction of read pairs assigned", colour = "siRNA") +
+  theme_tutorial()
+```
+
+```{r}
+#| label: fc-table
+fc |>
+  select(run, sirna, setting, fraction) |>
+  pivot_wider(names_from = setting, values_from = fraction) |>
+  knitr::kable(row.names = FALSE, digits = 3)
+```
+
+`-s 0` assigns the most read pairs, and `-s 1` and `-s 2` each assign
+roughly half as many: again the unstranded pattern. (The assigned fraction
+is high overall because the demo BAM files contain only reads that aligned
+inside the gene panel.)
+
+## Decision
+
+::: {.callout-important}
+## Measured: unstranded
+Both methods agree that the library is **unstranded**, as expected from the
+kit. All tools in this book therefore use:
+
+- featureCounts: `-s 0`
+- HISAT2: no `--rna-strandness` option
+- rMATS-turbo: `--libType fr-unstranded`
+:::
+
+For unstranded data, the strand of a spliced read is still known from the
+splice-site motif, which is how recount3 and rMATS assign junctions to the
+correct strand. What is lost is the ability to tell apart overlapping genes
+on opposite strands, and antisense transcription from sense transcription.
+
+::: {.callout-tip}
+## Check your understanding
+1. infer_experiment reports 0.03 for `1++,1--,2+-,2-+` and 0.95 for
+   `1+-,1-+,2++,2--`. What are the featureCounts, HISAT2 and rMATS settings?
+2. A colleague ran featureCounts with `-s 1` on a dUTP library. Which
+   symptom would you expect in the featureCounts summary?
+3. Why is "take the first 5 million reads" not a safe way to subsample a
+   run, and what would be a safe way?
+4. Our data are unstranded. Can recount3 still tell us on which strand a
+   splice junction lies?
+
+::: {.callout-note collapse="true"}
+## Answers
+1. Reverse-stranded (dUTP): featureCounts `-s 2`, HISAT2
+   `--rna-strandness RF`, rMATS `--libType fr-firststrand`.
+2. A very low fraction of "Assigned" and a large number of
+   "Unassigned_NoFeatures" reads, because almost every read points the wrong
+   way relative to its gene.
+3. Files can be sorted (by position, by barcode, by flow cell tile), so the
+   first reads may come from one region or one tile. Sample randomly from
+   the whole file, for example with `seqtk sample` or `samtools view -s`
+   (which needs the whole file to be read once).
+4. Yes. The strand of a junction follows from the splice-site motif (GT-AG
+   on the plus strand appears as CT-AC on the minus strand), not from the
+   library.
+:::
+:::

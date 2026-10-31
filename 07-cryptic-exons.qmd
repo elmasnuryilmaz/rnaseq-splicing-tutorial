@@ -1,0 +1,471 @@
+# Cryptic exons from junction counts {#sec-cryptic}
+
+A **cryptic exon** is a piece of intron that is normally not part of mature
+mRNA but gets spliced in under some condition, here the loss of TDP-43
+[@ling2015]. Because cryptic exons are, by definition, absent from the
+annotation, gene-level counts cannot see them, and annotation-based splicing
+tools may miss them too.
+
+What every spliced read *does* leave behind is a **splice junction**: the
+exact intron it skipped. recount3 provides junction counts for every sample,
+so we can look for cryptic exons without touching a single read. The logic
+is simple:
+
+> A cryptic splice junction is **absent from the reference annotation**,
+> **absent or very rare in controls**, and **present in the knockdown**.
+
+The hard part is making "absent", "rare" and "present" precise, and doing
+so before looking at the answer.
+
+```{r}
+#| label: setup
+source("R/helpers.R")
+source("R/sashimi.R")
+suppressPackageStartupMessages({
+  library(GenomicFeatures)
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+})
+```
+
+## Junction counts in recount3
+
+```{r}
+#| label: load
+rj <- load_jxn_rse()
+samples <- sample_table(rj)
+keep_s <- samples$run[samples$sirna %in% c("scramble", "TDP43")]
+rj <- rj[, keep_s]
+grp <- droplevels(samples[keep_s, "sirna"])
+table(grp)
+rj
+```
+
+Each row is one junction, written as `chrom:start-end:strand`, where
+`start` and `end` are the **first and last base of the intron** (1-based,
+inclusive). The strand is inferred from the splice-site motif (GT-AG and its
+variants), not from the library, which is why it is available even for this
+unstranded data set. A few hundred junctions have an unknown strand
+(non-canonical motifs); we drop them, together with junctions that have no
+reads in our 12 samples.
+
+```{r}
+#| label: clean
+jr <- rowRanges(rj)
+keep_j <- as.character(strand(jr)) != "*" & rowSums(assay(rj)) > 0
+rj <- rj[keep_j, ]
+jr <- rowRanges(rj)
+cnt <- as.matrix(assay(rj))
+kd <- grp == "TDP43"; ct <- grp == "scramble"
+c(junctions = nrow(rj), reads = sum(cnt))
+```
+
+## Which junctions are in GENCODE v26?
+
+recount3 adds its own annotation flags, but they are computed against a
+*union* of several annotations (GENCODE releases, RefSeq and others). To keep
+one annotation throughout, we build the intron list from the same GENCODE v26
+GTF that produced our gene counts.
+
+```{r}
+#| label: introns
+txdb <- gencode_txdb()
+introns <- unique(unlist(intronsByTranscript(txdb)))
+length(introns)
+```
+
+Before trusting any overlap, check that the two coordinate systems agree. If
+junction and intron coordinates were off by one base, almost nothing would
+match exactly:
+
+```{r}
+#| label: coord-check
+tot <- rowSums(cnt)
+frac_annot <- function(gr) sum(tot[gr %in% introns]) / sum(tot)
+round(c(as_is = frac_annot(jr),
+        shift_minus1 = frac_annot(shift(jr, -1)),
+        shift_plus1  = frac_annot(shift(jr, 1))), 4)
+```
+
+About 98% of all junction reads fall exactly on a GENCODE v26 intron, and
+almost none do after a one-base shift, so the conventions match.
+
+::: {.callout-tip}
+## Always run a coordinate sanity check
+BED files are 0-based and half-open; GTF, SAM and recount3 are 1-based; some
+tools report the last exon base instead of the first intron base. A shift of
+one base silently turns every annotated junction into a "novel" one. The
+check above takes one line and catches that.
+:::
+
+Each junction is now classified by its two ends. On the plus strand the
+intron start is the 5' splice site (donor) and the end is the 3' splice site
+(acceptor); on the minus strand it is the other way round.
+
+```{r}
+#| label: classify
+key <- function(chr, pos, str) paste(chr, pos, str)
+donor_pos    <- function(gr) ifelse(strand(gr) == "+", start(gr), end(gr))
+acceptor_pos <- function(gr) ifelse(strand(gr) == "+", end(gr), start(gr))
+known_donor    <- key(seqnames(introns), donor_pos(introns), strand(introns))
+known_acceptor <- key(seqnames(introns), acceptor_pos(introns), strand(introns))
+
+annotated <- jr %in% introns
+d_ok <- key(seqnames(jr), donor_pos(jr), strand(jr)) %in% known_donor
+a_ok <- key(seqnames(jr), acceptor_pos(jr), strand(jr)) %in% known_acceptor
+jclass <- case_when(
+  annotated     ~ "annotated",
+  d_ok & a_ok   ~ "known sites, new pair",
+  d_ok & !a_ok  ~ "novel acceptor",
+  !d_ok & a_ok  ~ "novel donor",
+  TRUE          ~ "both sites novel")
+table(jclass)
+```
+
+How does this compare with recount3's own flag?
+
+```{r}
+#| label: r3-flag
+table(recount3_annotated = jr$annotated, GENCODE_v26 = annotated)
+```
+
+Tens of thousands of junctions that recount3 calls "annotated" are not in
+GENCODE v26; they come from other annotation sources. Using the recount3 flag
+would therefore mix annotations, which is exactly what we want to avoid.
+
+## Junction usage: a PSI for splice sites
+
+Raw junction counts depend on sequencing depth and on how much the gene is
+expressed. To compare a junction across samples we use its **usage**: the
+fraction of reads at its splice sites that use this particular junction.
+
+$$
+\text{usage}_j = \frac{n_j}{\max\left(\sum_{k \in D(j)} n_k,\ \sum_{k \in A(j)} n_k\right)}
+$$
+
+where $D(j)$ is the set of junctions that share the donor of $j$ and $A(j)$
+the set that share its acceptor. Usage behaves like a percent spliced in
+(PSI) for one splice site: 0 means never used, 1 means always used.
+
+```{r}
+#| label: usage
+sum_by <- function(keys) {
+  m <- rowsum(cnt, keys)
+  m[match(keys, rownames(m)), , drop = FALSE]
+}
+den <- pmax(sum_by(key(seqnames(jr), donor_pos(jr), strand(jr))),
+            sum_by(key(seqnames(jr), acceptor_pos(jr), strand(jr))))
+usage <- cnt / den
+usage_kd <- rowMeans(usage[, kd], na.rm = TRUE)
+usage_ct <- rowMeans(usage[, ct], na.rm = TRUE)
+```
+
+## Two predefined definitions of "cryptic"
+
+There is no single correct way to turn "absent in control, present in
+knockdown" into numbers, so we wrote down two definitions **before**
+looking at any candidate, and we report both.
+
+Both require that the junction is **not in GENCODE v26** and that it is
+**supported in the knockdown**: at least 3 reads in at least 4 of the 6
+knockdown samples (a replicate-consistency rule, so that one sample cannot
+create a candidate on its own).
+
+| | Definition A: absolute | Definition B: relative |
+|---|---|---|
+| Control | at most 2 reads in total across the 6 scramble samples | mean usage < 0.05 |
+| Knockdown | at least 20 reads in total | mean usage at least 0.1 higher than control |
+| Weakness | depends on depth and on gene expression | can miss rare junctions in highly expressed genes |
+
+The 0.1 in definition B is the same effect size as our splicing default
+(|ΔPSI| > 0.1).
+
+```{r}
+#| label: definitions
+novel <- !annotated
+support_kd <- rowSums(cnt[, kd] >= 3) >= 4
+def_A <- novel & support_kd & rowSums(cnt[, ct]) <= 2 & rowSums(cnt[, kd]) >= 20
+def_B <- novel & support_kd & usage_ct < 0.05 & (usage_kd - usage_ct) >= 0.1
+c(definition_A = sum(def_A), definition_B = sum(def_B),
+  both = sum(def_A & def_B), union = sum(def_A | def_B))
+```
+
+### Positive control: STMN2
+
+*STMN2* is the best-documented cryptic exon target of TDP-43 in human motor
+neurons [@klim2019; @melamed2019]. In the knockdown, exon 1 splices to a
+cryptic exon (often called exon 2a) inside intron 1 instead of to exon 2.
+Any sensible method should find it.
+
+```{r}
+#| label: stmn2
+s2 <- names(jr) == "chr8:79611215-79616821:+"   # exon 1 -> cryptic exon 2a
+stmn2 <- which(as.character(seqnames(jr)) == "chr8" & start(jr) == 79611215 &
+                 strand(jr) == "+")
+data.frame(junction = names(jr)[stmn2], class = jclass[stmn2],
+           reads_KD = rowSums(cnt[stmn2, kd, drop = FALSE]),
+           reads_control = rowSums(cnt[stmn2, ct, drop = FALSE]),
+           usage_KD = round(usage_kd[stmn2], 3), usage_control = round(usage_ct[stmn2], 3),
+           def_A = def_A[stmn2], def_B = def_B[stmn2]) |>
+  arrange(desc(reads_KD)) |>
+  knitr::kable(row.names = FALSE)
+```
+
+The junction from exon 1 to the cryptic exon (`chr8:79611215-79616821:+`)
+has `r format(sum(cnt[s2, kd]), big.mark = ",")` reads in the knockdown, and
+on average `r round(100 * usage_kd[s2])`% of exon 1 splicing uses it. Yet
+**definition A misses it**, because `r sum(cnt[s2, ct])` reads in the
+controls are "more than 2". In a highly expressed gene like *STMN2* even a
+very rare event (usage `r signif(usage_ct[s2], 1)` in controls) produces a
+few reads. This is the weakness of absolute thresholds, and the reason
+definition B exists. Definition B, in turn, misses rare cryptic junctions in
+genes where the normal junction dominates. Reporting both, plus their union,
+is more honest than picking whichever looks better.
+
+## The candidate list
+
+```{r}
+#| label: gene-names
+genes <- genes(txdb, single.strand.genes.only = TRUE)
+gtf_genes <- rtracklayer::import(gencode_gtf(), feature.type = "gene")
+gene_name <- setNames(gtf_genes$gene_name, gtf_genes$gene_id)
+gene_type <- setNames(gtf_genes$gene_type, gtf_genes$gene_id)
+name_junction <- function(idx) {
+  ov <- findOverlaps(jr[idx], genes, type = "within")
+  hits <- data.frame(q = queryHits(ov), id = names(genes)[subjectHits(ov)])
+  hits$pc <- gene_type[hits$id] == "protein_coding"
+  hits <- hits[order(hits$q, !hits$pc), ]
+  out <- rep(NA_character_, length(idx))
+  first <- hits[!duplicated(hits$q), ]
+  out[first$q] <- gene_name[first$id]
+  out
+}
+```
+
+```{r}
+#| label: candidates
+cand_idx <- which(def_A | def_B)
+cand <- data.frame(
+  junction = names(jr)[cand_idx],
+  gene = name_junction(cand_idx),
+  class = jclass[cand_idx],
+  reads_KD = rowSums(cnt[cand_idx, kd]),
+  reads_control = rowSums(cnt[cand_idx, ct]),
+  usage_KD = round(usage_kd[cand_idx], 3),
+  usage_control = round(usage_ct[cand_idx], 3),
+  def_A = def_A[cand_idx], def_B = def_B[cand_idx]
+) |>
+  mutate(delta_usage = round(usage_KD - usage_control, 3)) |>
+  arrange(desc(delta_usage))
+write.csv(cand, "results/cryptic_junction_candidates.csv", row.names = FALSE)
+knitr::kable(cand, row.names = FALSE)
+```
+
+It is worth comparing such a list with published TDP-43 cryptic exons (for
+example those reported by @brown2022 and @ma2022 in other neuronal models),
+but a match in the literature is support, not proof. A list like this is a
+set of **candidates**: every line still needs to be looked at before it can
+be called a cryptic exon.
+
+```{r}
+#| label: fig-candidates
+#| fig-cap: "Junction usage in control (x) and knockdown (y) for all novel junctions with knockdown support. Candidates from definition A, B or both are coloured."
+#| fig-width: 6.5
+#| fig-height: 5
+pd <- data.frame(u_ct = usage_ct, u_kd = usage_kd,
+                 status = case_when(def_A & def_B ~ "A and B", def_A ~ "A only",
+                                    def_B ~ "B only", TRUE ~ "neither"))[novel & support_kd, ]
+ggplot(arrange(pd, status != "neither"), aes(u_ct, u_kd, colour = status)) +
+  geom_abline(linetype = "dashed", linewidth = 0.3) +
+  geom_point(size = 1.4, alpha = 0.8) +
+  scale_colour_manual(values = c(`A and B` = "#D55E00", `A only` = "#E69F00",
+                                 `B only` = "#0072B2", neither = "grey80")) +
+  labs(x = "Mean usage, scramble", y = "Mean usage, TDP-43 knockdown", colour = "Definition") +
+  coord_equal() +
+  theme_tutorial()
+```
+
+## From junctions to exons
+
+A cassette cryptic exon leaves **two** novel junctions: one into the exon
+(its acceptor is new) and one out of it (its donor is new). On the genome,
+the first junction ends just before the exon and the second starts just
+after it. We can pair them automatically among all novel junctions with
+knockdown support.
+
+```{r}
+#| label: pairs
+sup <- which(novel & support_kd)
+s_gr <- jr[sup]
+# For every junction i, look for a junction j that starts 1 to 500 bases after
+# i ends, on the same chromosome and strand. The bases in between are the exon.
+after_i <- GRanges(seqnames(s_gr), IRanges(end(s_gr) + 2, end(s_gr) + 501), strand = strand(s_gr))
+start_j <- GRanges(seqnames(s_gr), IRanges(start(s_gr), width = 1), strand = strand(s_gr))
+ov <- findOverlaps(after_i, start_j)
+cryptic_exons <- data.frame(i = queryHits(ov), j = subjectHits(ov)) |>
+  mutate(chrom = as.character(seqnames(s_gr))[i], strand = as.character(strand(s_gr))[i],
+         exon_start = end(s_gr)[i] + 1, exon_end = start(s_gr)[j] - 1,
+         exon_length = exon_end - exon_start + 1,
+         in_junction = names(s_gr)[i], out_junction = names(s_gr)[j]) |>
+  filter(in_junction %in% cand$junction | out_junction %in% cand$junction) |>
+  mutate(gene = name_junction(sup[i]),
+         frame = ifelse(exon_length %% 3 == 0, "in frame (multiple of 3)", "frameshift")) |>
+  select(gene, chrom, exon_start, exon_end, strand, exon_length, frame, in_junction, out_junction)
+write.csv(cryptic_exons, "results/cryptic_exons_paired.csv", row.names = FALSE)
+knitr::kable(cryptic_exons, row.names = FALSE)
+```
+
+Three things in this table deserve a comment:
+
+- The main *STMN2* event (exon 1 to exon 2a) is **not** in the table. The
+  cryptic exon 2a has a junction into it but none out of it, because
+  transcripts end inside it at a cryptic polyadenylation site
+  [@melamed2019]. It behaves like an alternative last exon, not a cassette
+  exon. Keep this in mind for @sec-rmats, where we use a tool that models
+  cassette-type events. What the table does show for *STMN2* is a minor
+  path through a small 115-nt exon between exon 1 and exon 2a; you can see
+  its two small arcs in the *STMN2* sashimi plot below.
+- Rows without a gene name on chromosome 17 (around 38 Mb) fall in the
+  *TBC1D3* gene family, a set of near-identical gene copies created by
+  segmental duplication. Reads there can be assigned to the wrong copy, so
+  these candidates need extra caution.
+- Some pairs share one junction (for example two alternative acceptors in
+  *SLC24A3*). Junction pairing describes possible exons; it does not tell
+  you which transcript isoforms exist.
+
+::: {.callout-warning}
+## Frameshift is not the same as "undergoes NMD"
+A cryptic exon whose length is not a multiple of 3 shifts the reading frame
+and usually creates a premature termination codon (PTC). If that PTC lies
+more than about 50 to 55 nucleotides upstream of the last exon-exon
+junction, the transcript is **predicted** to be a target of nonsense-mediated
+decay [@nagy1998]. This is a prediction from sequence. Saying that a
+transcript "undergoes NMD" requires experiments, for example blocking NMD
+(cycloheximide, or knockdown of UPF1) and showing that the cryptic isoform
+accumulates.
+:::
+
+## A gene that is not on the list: UNC13A
+
+*UNC13A* carries a cryptic exon between exons 20 and 21 when TDP-43 is lost
+[@brown2022; @ma2022]. Its gene-level expression did not change in
+@sec-de. What do the junctions say?
+
+```{r}
+#| label: unc13a
+unc <- which(as.character(seqnames(jr)) == "chr19" & start(jr) >= 17641000 &
+               end(jr) <= 17643000 & strand(jr) == "-")
+data.frame(junction = names(jr)[unc], class = jclass[unc],
+           KD_per_sample = apply(cnt[unc, kd], 1, paste, collapse = ","),
+           control_per_sample = apply(cnt[unc, ct], 1, paste, collapse = ","),
+           usage_KD = round(usage_kd[unc], 3), usage_control = round(usage_ct[unc], 3)) |>
+  knitr::kable(row.names = FALSE)
+```
+
+The two junctions that flank the cryptic exon (`17641557-17642413` and
+`17642542-17642844`) are absent from all six controls and present in several
+knockdown samples, but with only a handful of reads, so they fail the
+support rule (3 reads in at least 4 of 6 knockdown samples). The pattern is
+consistent with the published cryptic exon, but it does not pass our
+predefined criteria. The correct description is an **exploratory signal**,
+not a finding. With a partial knockdown, a cell-type-specific gene and
+12 to 57 million read pairs per sample, that is about what one should
+expect.
+
+## Visual confirmation
+
+Counts alone are not enough to claim a cryptic exon: a junction can come
+from a mapping artefact, a repeat, or a single odd sample. The standard
+check is a **sashimi plot**: read coverage along the gene with arcs showing
+junction reads. A real cryptic exon shows coverage over the new exon in the
+knockdown, together with arcs into (and, for cassette exons, out of) it.
+
+We build a simple sashimi-style plot from recount3 files only: coverage
+from the per-sample BigWig files and arcs from the junction counts
+(`R/sashimi.R`). For publication-quality plots from BAM files, use ggsashimi
+[@garridomartin2018] or IGV [@robinson2011].
+
+```{r}
+#| label: plot-setup
+mapped <- setNames(samples$mapped_pairs, samples$run)
+groups <- list(scramble = keep_s[ct], `TDP-43 KD` = keep_s[kd])
+gcols <- c(scramble = unname(SIRNA_COLS["scramble"]), `TDP-43 KD` = unname(SIRNA_COLS["TDP43"]))
+```
+
+```{r}
+#| label: fig-sashimi-stmn2
+#| fig-cap: "STMN2, exon 1 to exon 2. In the knockdown, an unannotated junction (orange arc) leads from exon 1 into intron 1, coverage appears just downstream of it (the cryptic exon 2a), and coverage over exon 2 drops. Mean of 6 samples per group."
+#| fig-width: 9
+#| fig-height: 6
+sashimi_plot("chr8", 79610500, 79638500, "+", groups, cnt, jr, novel, txdb, mapped,
+             min_mean_reads = 5, title = "STMN2", group_cols = gcols)
+```
+
+```{r}
+#| label: fig-sashimi-cassette
+#| fig-cap: "The candidate with the strongest paired cassette exon. Mean of 6 samples per group; arcs show mean junction reads per sample."
+#| fig-width: 9
+#| fig-height: 6
+ce <- cryptic_exons |> filter(!is.na(gene)) |>
+  left_join(cand |> select(junction, reads_KD), by = c("in_junction" = "junction")) |>
+  arrange(desc(reads_KD)) |> slice(1)
+flank <- 1200
+sashimi_plot(ce$chrom, ce$exon_start - flank, ce$exon_end + flank, ce$strand, groups,
+             cnt, jr, novel, txdb, mapped, min_mean_reads = 1, title = ce$gene,
+             highlight = data.frame(start = ce$exon_start, end = ce$exon_end),
+             group_cols = gcols)
+```
+
+```{r}
+#| label: fig-sashimi-unc13a
+#| fig-cap: "UNC13A, exons 20 to 21 region. The cryptic exon junctions are visible in the knockdown only, at low read counts (exploratory signal)."
+#| fig-width: 9
+#| fig-height: 6
+sashimi_plot("chr19", 17641000, 17643400, "-", groups, cnt, jr, novel, txdb, mapped,
+             min_mean_reads = 0.5, title = "UNC13A",
+             highlight = data.frame(start = 17642414, end = 17642541),
+             group_cols = gcols)
+```
+
+Group means hide variation between samples. Before you report a cryptic
+exon, also look at each sample separately (the per-sample junction counts
+in the tables above, or individual BAM files in IGV, as in @sec-rmats).
+
+## What we can and cannot say
+
+| Statement | Supported here? |
+|---|---|
+| "Knockdown of TDP-43 is associated with inclusion of an unannotated exon in *STMN2*" | Yes: junction counts in all 6 KD samples, near-absent in controls, visible in coverage |
+| "The *STMN2* cryptic exon reduces STMN2 protein" | No: RNA-seq does not measure protein |
+| "*UNC13A* cryptic exon inclusion" | Exploratory signal only: consistent direction, too few reads to pass our criteria |
+| "Cryptic exon X causes NMD" | No: at most "predicted NMD target" from sequence |
+
+::: {.callout-tip}
+## Check your understanding
+1. Why do we define "annotated" with our own GENCODE v26 intron list
+   instead of the `annotated` column that recount3 provides?
+2. Definition A misses the *STMN2* cryptic junction. Should we loosen
+   definition A until it is found?
+3. A candidate junction has 40 reads in one knockdown sample and 0 in the
+   other five. Does it pass the support rule? Should it?
+4. Why does the *STMN2* cryptic exon not appear in the paired-junction
+   table?
+
+::: {.callout-note collapse="true"}
+## Answers
+1. The recount3 flag uses a union of annotation sources and releases. Mixing
+   it with GENCODE v26 gene counts would break the one-annotation rule and
+   change what "novel" means.
+2. No. Changing a threshold until a favoured gene appears is tuning to the
+   result. The right response is what we did: understand why it is missed
+   (an absolute count threshold depends on expression), use a second
+   predefined definition that addresses that weakness, and report both.
+3. No: the rule needs at least 3 reads in at least 4 of 6 knockdown samples.
+   A signal from one sample could be a sample-specific artefact or a
+   mapping problem; replication across samples is the point.
+4. The cryptic exon is a terminal exon (transcripts end in it), so there is
+   a junction into it but none out of it. Our pairing looks for cassette
+   exons with junctions on both sides.
+:::
+:::

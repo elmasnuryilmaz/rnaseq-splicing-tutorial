@@ -1,0 +1,402 @@
+# Event-level splicing with rMATS-turbo {#sec-rmats}
+
+@sec-cryptic worked with junctions one at a time. Event-level tools take
+the next step: they group junctions and exons into **splicing events** and
+test whether the proportion of transcripts that include an exon changes
+between conditions. rMATS [@shen2014] is one of the most widely used; its
+current implementation, rMATS-turbo, is described in detail by
+@wang2024. This chapter explains what rMATS computes, shows the exact
+command we ran on the demo data from @sec-strand, and spends most of its
+time on **reading the output correctly**, which is where most mistakes
+happen.
+
+```{r}
+#| label: setup
+source("R/helpers.R")
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+})
+```
+
+## What rMATS models
+
+rMATS knows five event types. Each event has an *inclusion* form and a
+*skipping* form:
+
+| Event | Inclusion form | Skipping form |
+|---|---|---|
+| SE, skipped (cassette) exon | upstream - **exon** - downstream | upstream - downstream |
+| A5SS, alternative 5' splice site | longer exon (downstream donor) | shorter exon |
+| A3SS, alternative 3' splice site | longer exon (upstream acceptor) | shorter exon |
+| MXE, mutually exclusive exons | contains the first exon | contains the second exon |
+| RI, retained intron | intron kept | intron spliced out |
+
+For every event and sample, rMATS counts reads that support each form:
+
+- **IJC** (inclusion junction count) and **SJC** (skipping junction count).
+- In the **JC** output only reads that span a splice junction are counted.
+  In the **JCEC** output, reads that fall entirely inside the alternative
+  exon body are added to the inclusion count. JCEC has more reads, but exon
+  body reads are also affected by things other than splicing (coverage
+  bias, overlapping features), so the two are reported **separately** and
+  should be kept separate.
+
+Because the inclusion form usually has more possible read positions than the
+skipping form, rMATS normalises by the "effective lengths" `IncFormLen` and
+`SkipFormLen`:
+
+$$
+\hat{\psi} = \frac{\text{IJC}/\text{IncFormLen}}{\text{IJC}/\text{IncFormLen} + \text{SJC}/\text{SkipFormLen}}
+$$
+
+$\hat\psi$ (percent spliced in, PSI) is reported per sample as `IncLevel1`
+and `IncLevel2`. The test asks whether the mean PSI differs between the two
+groups by more than a small cut-off, using a hierarchical model that
+accounts for both read sampling and variation between replicates, and the
+p-values are converted to FDR with the Benjamini-Hochberg method.
+
+::: {.callout-important}
+## Which group is which
+`IncLevelDifference = mean(IncLevel1) - mean(IncLevel2)`, where 1 is the
+`--b1` group and 2 the `--b2` group. We used **b1 = TDP-43 knockdown** and
+**b2 = scramble**, so a **positive ΔPSI means more inclusion in the
+knockdown**. Always write this down; with the groups swapped, every sign in
+the table flips.
+:::
+
+## The command
+
+The inputs are two text files that list the BAM files of each group
+(comma-separated), and a GTF. Every option reflects something we measured
+or decided earlier:
+
+```bash
+# b1.txt: knockdown BAMs, b2.txt: scramble BAMs (comma-separated, one line)
+rmats.py \
+  --b1 b1.txt --b2 b2.txt \
+  --gtf work/demo/ref/panel.gtf \   # GENCODE v26, the same annotation as everywhere else
+  -t paired \                       # paired-end library (chapter 2)
+  --readLength 76 \                 # real read length (chapter 2)
+  --libType fr-unstranded \         # measured, not assumed (chapter 4)
+  --novelSS \                       # we are looking for unannotated (cryptic) splice sites
+  --nthread 4 --od work/demo/rmats --tmp work/demo/rmats_tmp
+```
+
+Why these options matter:
+
+- **`--readLength`** must be the real read length. rMATS uses it to compute
+  effective lengths, and by default it ignores reads of a different length.
+  If your reads were trimmed to different lengths, add
+  `--variable-read-length`; if the aligner soft-clips reads, add
+  `--allow-clipping` (we avoided both by aligning with `--no-softclip`).
+- **`-t paired`** or **`-t single`** must match the library.
+- **`--libType`** comes from @sec-strand.
+- **`--novelSS`** lets rMATS build events from splice sites that are not in
+  the GTF. Without it, an exon defined by two novel splice sites, which is
+  exactly what a cryptic exon is, cannot be found. Use it when you are
+  looking for novel or cryptic events; for a standard analysis of annotated
+  events, leave it off, since it adds many low-confidence events and makes
+  the multiple-testing correction harsher.
+
+The group files used for the demo:
+
+```{r}
+#| label: groups
+cat("b1 (TDP-43 KD):", gsub(",", "\n   ", readLines("data/demo/rmats/b1.txt")), "\n")
+cat("b2 (scramble): ", gsub(",", "\n   ", readLines("data/demo/rmats/b2.txt")), "\n")
+```
+
+## The output files
+
+```{r}
+#| label: files
+list.files("data/demo/rmats", pattern = "MATS")
+```
+
+There is one file per event type, in two versions (JC and JCEC). rMATS also
+writes intermediate files (`fromGTF.*`, `JC.raw.input.*` and others) that we
+do not need here.
+
+```{r}
+#| label: summary-file
+read.delim("data/demo/rmats/summary.txt") |>
+  knitr::kable(row.names = FALSE)
+```
+
+## Reading the tables: by column name, never by position
+
+The five event types do not have the same columns. SE, A5SS, A3SS and RI
+describe one alternative region, but MXE describes **two** alternative exons
+and therefore has two more coordinate columns:
+
+```{r}
+#| label: columns
+se  <- read.delim("data/demo/rmats/SE.MATS.JC.txt")
+mxe <- read.delim("data/demo/rmats/MXE.MATS.JC.txt")
+names(se)
+names(mxe)
+c(FDR_column_in_SE = which(names(se) == "FDR"), FDR_column_in_MXE = which(names(mxe) == "FDR"))
+```
+
+A filter written as `awk '$20 < 0.05'` therefore filters FDR in the SE file
+but a completely different column in the MXE file, and nothing warns you.
+Filter by **column name**, in R or pandas, and the same code works for every
+event type.
+
+::: {.callout-warning}
+## Coordinates in rMATS output are 0-based
+`exonStart_0base` is 0-based, as the name says, while `exonEnd` is the
+1-based end. The exon in normal 1-based coordinates is
+`exonStart_0base + 1` to `exonEnd`. Forgetting this puts every exon one base
+off when you compare with GTF or recount3 coordinates.
+:::
+
+A reader that works for every event type:
+
+```{r}
+#| label: reader
+read_rmats <- function(event, count_type, dir = "data/demo/rmats") {
+  f <- file.path(dir, sprintf("%s.MATS.%s.txt", event, count_type))
+  x <- read.delim(f, stringsAsFactors = FALSE)
+  if (nrow(x) == 0) return(NULL)
+  # IJC_SAMPLE_1, SJC_SAMPLE_1, ... hold comma-separated per-replicate values
+  split_sum <- function(a, b) {
+    mapply(function(i, s) as.numeric(strsplit(i, ",")[[1]]) + as.numeric(strsplit(s, ",")[[1]]),
+           a, b, SIMPLIFY = FALSE)
+  }
+  reads_g1 <- split_sum(x$IJC_SAMPLE_1, x$SJC_SAMPLE_1)
+  reads_g2 <- split_sum(x$IJC_SAMPLE_2, x$SJC_SAMPLE_2)
+  x$mean_reads_per_sample <- mapply(function(a, b) mean(c(a, b)), reads_g1, reads_g2)
+  x$event_type <- event
+  x$count_type <- count_type
+  x
+}
+```
+
+## Filtering
+
+Our predefined filter, applied to the JC and JCEC results separately:
+
+- **FDR < 0.05**,
+- **|ΔPSI| > 0.1** (`abs(IncLevelDifference) > 0.1`),
+- **at least 10 informative reads per sample on average**: the mean over all
+  samples of IJC + SJC must be at least 10. Events with very few reads can
+  produce extreme PSI values from a handful of reads.
+
+```{r}
+#| label: filter
+events <- c("SE", "A5SS", "A3SS", "MXE", "RI")
+all_events <- lapply(c("JC", "JCEC"), function(ct)
+  bind_rows(lapply(events, read_rmats, count_type = ct)))
+names(all_events) <- c("JC", "JCEC")
+
+apply_filter <- function(x) {
+  x |>
+    mutate(pass_fdr = FDR < SPLICE_FDR,
+           pass_dpsi = abs(IncLevelDifference) > SPLICE_DPSI,
+           pass_reads = mean_reads_per_sample >= 10,
+           significant = pass_fdr & pass_dpsi & pass_reads)
+}
+filtered <- lapply(all_events, apply_filter)
+
+bind_rows(filtered) |>
+  group_by(count_type, event_type) |>
+  summarise(tested = n(),
+            FDR_only = sum(pass_fdr),
+            FDR_and_dPSI = sum(pass_fdr & pass_dpsi),
+            all_filters = sum(significant), .groups = "drop") |>
+  knitr::kable(row.names = FALSE)
+```
+
+The read filter matters: some events reach a low FDR with very few reads.
+Note that the multiple-testing family here is **the events in our 17-gene
+panel**, not the genome. An FDR from a targeted panel is not comparable with
+an FDR from a genome-wide run; say which one you report.
+
+## The significant events
+
+```{r}
+#| label: sig-events
+sig_jc <- filtered$JC |>
+  filter(significant) |>
+  mutate(exon = case_when(
+    event_type == "SE" ~ paste0(chr, ":", exonStart_0base + 1, "-", exonEnd),
+    event_type == "MXE" ~ paste0(chr, ":", X1stExonStart_0base + 1, "-", X1stExonEnd,
+                                 " or ", X2ndExonStart_0base + 1, "-", X2ndExonEnd))) |>
+  arrange(FDR)
+sig_jc |>
+  transmute(event_type, gene = geneSymbol, strand, exon,
+            `PSI KD (per sample)` = IncLevel1, `PSI scramble (per sample)` = IncLevel2,
+            dPSI = IncLevelDifference, FDR = formatC(FDR, format = "e", digits = 1),
+            mean_reads = round(mean_reads_per_sample)) |>
+  knitr::kable(row.names = FALSE)
+write.csv(sig_jc, "results/rmats_demo_significant_JC.csv", row.names = FALSE)
+```
+
+rMATS writes an FDR of exactly 0 when the value is below its numerical
+precision; read it as "very small", not as certainty. How to read the table:
+
+- The same exon can appear in several rows (here *MADD*), once for each
+  combination of flanking exons that rMATS found. When you count results,
+  count **exons**, not rows.
+- Two of the strongest events are **annotated** exons that are skipped more
+  often in the knockdown (negative ΔPSI). One is in *POLDIP3*, a gene whose
+  splicing is known to change when TDP-43 is lost [@shiga2012]; the other is
+  in *KCNQ2*, and it is the same event that appeared in @sec-cryptic as a
+  "known sites, new pair" junction: the skipping junction joins two
+  annotated splice sites that GENCODE v26 never pairs.
+- The others are **cryptic** exons with positive ΔPSI (*KALRN*, *GRAMD1A*,
+  *EPB41L4A*, *MADD*): almost never included in scramble, included in a
+  fraction of transcripts in the knockdown. These are the exons that needed
+  `--novelSS`.
+
+## Do rMATS and the junction analysis agree?
+
+@sec-cryptic paired novel junctions into candidate cassette exons. If rMATS
+works as intended, the cryptic exons in our panel genes should appear as
+significant SE events with a positive ΔPSI (more inclusion in the
+knockdown). We match them by their 1-based coordinates.
+
+```{r}
+#| label: compare
+ce <- read.csv("results/cryptic_exons_paired.csv")
+# rMATS can report the same exon several times, once for each pair of
+# flanking exons. Keep the best-supported event (smallest FDR) per exon.
+se_jc <- filtered$JC |> filter(event_type == "SE") |>
+  mutate(exon_start = exonStart_0base + 1, exon_end = exonEnd) |>
+  group_by(chr, exon_start, exon_end) |>
+  slice_min(FDR, n = 1, with_ties = FALSE) |>
+  ungroup()
+panel <- readLines("scripts/demo_genes.txt") |> grep(pattern = "^#", invert = TRUE, value = TRUE)
+ce |>
+  filter(gene %in% panel) |>
+  left_join(se_jc |> select(chr, exon_start, exon_end, IncLevelDifference, FDR,
+                            mean_reads_per_sample, significant),
+            by = c("chrom" = "chr", "exon_start", "exon_end")) |>
+  transmute(gene, exon = paste0(chrom, ":", exon_start, "-", exon_end), exon_length,
+            found_by_rMATS = !is.na(FDR), dPSI = round(IncLevelDifference, 3),
+            FDR = ifelse(is.na(FDR), NA, formatC(FDR, format = "e", digits = 1)),
+            mean_reads = round(mean_reads_per_sample),
+            significant) |>
+  knitr::kable(row.names = FALSE)
+```
+
+Most cryptic exons from @sec-cryptic are found by rMATS as SE events, all
+with a positive ΔPSI, but only one passes every filter in this small demo.
+The reasons are instructive:
+
+- **ΔPSI too small.** The *AGRN* cryptic exon has a tiny FDR and plenty of
+  reads, but it is included in only a few percent of transcripts, so ΔPSI
+  stays below 0.1. This is the same pattern that made definition B miss it
+  in @sec-cryptic: a rare event in a highly expressed gene.
+- **FDR too high.** Some exons (for example in *PFKP* and *SLC24A3*) have a
+  ΔPSI just above 0.1 but do not reach FDR < 0.05 with three samples per
+  group.
+
+Two broader lessons:
+
+1. **Event models only find what they model.** The main *STMN2* event
+   (exon 1 to the cryptic exon 2a, where transcripts end) is not a cassette
+   exon, an alternative splice site or a retained intron, so rMATS has no
+   event type for it. The junction analysis in @sec-cryptic finds it
+   easily.
+2. **Depth limits what can be called.** The demo uses 3 samples per group
+   from the shallower batch. A cryptic exon that is clear when junction
+   reads are summed over 12 samples can miss the read filter or the FDR
+   threshold here. That is a statement about power, not evidence that the
+   exon is absent.
+
+## Look at the reads
+
+The demo folder contains small BAM slices of the *STMN2* locus for one
+knockdown and one scramble sample (`data/demo/igv/`). To look at them:
+
+1. Open IGV [@robinson2011] and select the genome **hg38**.
+2. *File > Load from File*, and choose both `.bam` files (the `.bai` index
+   files must be in the same folder).
+3. Go to `chr8:79,610,500-79,638,500`.
+4. Right-click a track and choose **Sashimi Plot** to see junction arcs with
+   read counts.
+
+The knockdown track shows reads piling up just downstream of exon 1, inside
+intron 1, and split reads joining exon 1 to that region. This is the visual
+confirmation that goes together with the junction counts.
+
+## Gene level versus transcript level: DRIMSeq and stageR
+
+rMATS answers questions about **events**. A related question is whether the
+relative abundance of a gene's **transcripts** changes (differential
+transcript usage). DRIMSeq [@nowicka2016] tests this with a
+Dirichlet-multinomial model on transcript-level counts (for example from
+Salmon), and stageR [@vandenberge2017] controls the error rate in two
+stages: first screen genes, then confirm individual transcripts only within
+the genes that passed.
+
+The rule we follow:
+
+> If a gene is significant at the gene level, look for transcript-level
+> confirmation with stageR. If no transcript is confirmed, **say so**: the
+> gene shows evidence of changed transcript usage, but we cannot say which
+> transcript changes.
+
+We did not run DRIMSeq in this book. recount3 does not provide
+transcript-level counts, and quantifying transcripts would require the full
+reads of every sample. The code below shows the structure of the analysis
+for when you have Salmon output; it is not executed.
+
+```{r}
+#| label: drimseq-template
+#| eval: false
+library(DRIMSeq)
+library(stageR)
+
+# counts: data.frame with gene_id, feature_id (transcript) and one column per sample
+# samples: data.frame with sample_id and condition (scramble as reference level)
+d <- dmDSdata(counts = counts, samples = samples)
+d <- dmFilter(d, min_samps_gene_expr = 6, min_gene_expr = 10,
+              min_samps_feature_expr = 3, min_feature_expr = 10)
+design <- model.matrix(~ condition, data = DRIMSeq::samples(d))
+d <- dmPrecision(d, design = design)
+d <- dmFit(d, design = design)
+d <- dmTest(d, coef = "conditionTDP43")
+
+gene_p <- setNames(DRIMSeq::results(d)$pvalue, DRIMSeq::results(d)$gene_id)
+tx_res <- DRIMSeq::results(d, level = "feature")
+tx_p <- matrix(tx_res$pvalue, dimnames = list(tx_res$feature_id, "transcript"))
+stage <- stageRTx(pScreen = gene_p, pConfirmation = tx_p, pScreenAdjusted = FALSE,
+                  tx2gene = tx_res[, c("feature_id", "gene_id")])
+stage <- stageWiseAdjustment(stage, method = "dtu", alpha = 0.05)
+getAdjustedPValues(stage, order = TRUE, onlySignificantGenes = TRUE)
+```
+
+::: {.callout-tip}
+## Check your understanding
+1. rMATS reports `IncLevelDifference = 0.25` for an exon. In our setup, in
+   which group is the exon included more often?
+2. Why should JC and JCEC results not be merged into one table?
+3. A script filters rMATS output with `awk -F'\t' '$20 < 0.05'` for all five
+   event types. What goes wrong?
+4. Why can rMATS not detect the main *STMN2* cryptic exon event, even with
+   `--novelSS`?
+5. An event has FDR = 0.001 and ΔPSI = 0.6 but 4 reads per sample on
+   average. How do you report it?
+
+::: {.callout-note collapse="true"}
+## Answers
+1. In the knockdown: b1 = TDP-43 knockdown and the difference is b1 minus
+   b2.
+2. They count different things (junction reads only versus junction plus
+   exon body reads), so their PSI values and p-values are not
+   interchangeable. Report one as the primary analysis and say which.
+3. Column 20 is FDR in the SE, A5SS, A3SS and RI files, but not in the MXE
+   file, which has two extra coordinate columns. Filter by column name.
+4. The cryptic exon 2a ends transcripts at a cryptic polyadenylation site. It
+   is an alternative last exon, which is not one of the five rMATS event
+   types.
+5. It fails the predefined read filter, so it is not reported as
+   significant. You may mention it as an exploratory signal that needs more
+   depth or targeted validation (for example RT-PCR).
+:::
+:::

@@ -1,0 +1,19 @@
+"run","gsm","title","sirna","replicate","date","batch","layout","read_pairs","mapped_pairs","unique_pct"
+"SRR8083869","GSM3439294","no siRNA rep1","none",1,"2013-01-10","B1","paired",29517832,28993835,94.2
+"SRR8083870","GSM3439295","no siRNA rep2","none",2,"2013-06-10","B2","paired",21010237,20800109,95.3
+"SRR8083876","GSM3439301","no siRNA rep3","none",3,"2013-06-10","B2","paired",12255415,12099069,94.7
+"SRR8083864","GSM3439289","fluorescent siRNA rep1","fluorescent",1,"2013-01-10","B1","paired",36338577,35795521,94.8
+"SRR8083871","GSM3439296","fluorescent siRNA rep2","fluorescent",2,"2013-06-10","B2","paired",28057068,27797276,95.4
+"SRR8083877","GSM3439302","fluorescent siRNA rep3","fluorescent",3,"2013-06-10","B2","paired",15270757,15109371,95.2
+"SRR8083865","GSM3439290","scramble siRNA rep1","scramble",1,"2013-01-10","B1","paired",41466605,40829186,94.5
+"SRR8083866","GSM3439291","scramble siRNA rep2","scramble",2,"2013-01-10","B1","paired",33278121,32811422,94.9
+"SRR8083872","GSM3439297","scramble siRNA rep3","scramble",3,"2013-06-10","B2","paired",25205022,24960112,95.2
+"SRR8083873","GSM3439298","scramble siRNA rep4","scramble",4,"2013-06-10","B2","paired",17669950,17511051,95.6
+"SRR8083878","GSM3439303","scramble siRNA rep5","scramble",5,"2013-06-10","B2","paired",15903552,15728107,94.9
+"SRR8083879","GSM3439304","scramble siRNA rep6","scramble",6,"2013-06-10","B2","paired",13516360,13358100,95
+"SRR8083867","GSM3439292","TDP43 siRNA rep1","TDP43",1,"2013-01-10","B1","paired",57329553,56502937,94.8
+"SRR8083868","GSM3439293","TDP43 siRNA rep2","TDP43",2,"2013-01-10","B1","paired",39231704,38644438,94.7
+"SRR8083874","GSM3439299","TDP43 siRNA rep3","TDP43",3,"2013-06-10","B2","paired",20498949,20294695,95.4
+"SRR8083875","GSM3439300","TDP43 siRNA rep4","TDP43",4,"2013-06-10","B2","paired",18881604,18700736,95.5
+"SRR8083880","GSM3439305","TDP43 siRNA rep5","TDP43",5,"2013-06-10","B2","paired",14259398,14101255,95
+"SRR8083881","GSM3439306","TDP43 siRNA rep6","TDP43",6,"2013-06-10","B2","paired",14167853,14021734,95.2

@@ -16,6 +16,7 @@ book:
   repo-url: https://github.com/elmasnuryilmaz/rnaseq-splicing-tutorial
   repo-actions: [source, issue]
   search: true
+  page-footer: "Text and figures © 2026 Elmasnur Yılmaz, [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/). Code: MIT."
   chapters:
     - index.qmd
     - 01-setup.qmd

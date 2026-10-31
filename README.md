@@ -116,6 +116,5 @@ renv.lock, envs/   software versions
 When you use the analyses, please cite the original study (Klim et al. 2019)
 and the methods papers listed in the book's reference section.
 
-No licence has been chosen yet. A common choice for teaching material is
-CC BY 4.0 for the text and MIT for the code; the author will add a `LICENSE`
-file before the repository is made public.
+The text and figures are licensed under [CC BY 4.0](LICENSE-TEXT.md) and the
+code under the [MIT licence](LICENSE).

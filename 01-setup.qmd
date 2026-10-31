@@ -1,0 +1,154 @@
+# Setup and reproducibility {#sec-setup}
+
+A tutorial is only useful if you can run it and get the same numbers. This
+chapter explains how the project is organised, how to install exactly the
+software versions used to build the book, and how Quarto's *freeze* feature
+keeps the published book in sync with the code.
+
+## What you need
+
+| Component | Used for | Version used for this book |
+|---|---|---|
+| R | all analyses | `r paste(R.version$major, R.version$minor, sep = ".")` |
+| Bioconductor | DESeq2, recount3, fgsea and others | 3.20 |
+| Quarto | building the book | 1.4 or newer |
+| renv | restoring R package versions | `r as.character(packageVersion("renv"))` |
+| conda / mamba (optional) | command-line tools for chapters 4 and 8 | see `envs/ngs.yml` |
+
+About 1.5 GB of disk space is needed for downloads, almost all of it for the
+coverage files used in the sashimi plots of @sec-cryptic. Everything else is
+small: recount3 gene counts for this study are a few megabytes, and the
+junction counts about 25 MB.
+
+## Getting the project
+
+```bash
+git clone https://github.com/elmasnuryilmaz/rnaseq-splicing-tutorial.git
+cd rnaseq-splicing-tutorial
+```
+
+The project layout:
+
+```
+_quarto.yml          book configuration (chapters, freeze, bibliography)
+index.qmd ...        one .qmd file per chapter
+R/helpers.R          shared settings, thresholds and download helpers
+R/sashimi.R          sashimi-style plot used in chapter 7
+scripts/             shell, Python and R scripts that build the demo BAM files
+data/demo/           small outputs of the demo (strandedness, rMATS)
+results/             result tables written by the chapters
+renv.lock            exact R package versions
+envs/                conda environment files
+_freeze/             stored results of every executed chapter
+data-cache/          downloads (created on first run, not in git)
+```
+
+## R packages with renv
+
+[renv](https://rstudio.github.io/renv/) records the exact version of every
+R package in `renv.lock`. To install the same versions into a private
+project library:
+
+```r
+install.packages("renv")
+renv::restore()
+```
+
+Run this from the project folder. When R starts in the project folder,
+`.Rprofile` activates the project library automatically. Bioconductor
+packages are restored from the Bioconductor release recorded in the lockfile.
+
+::: {.callout-note}
+## How this book was built
+The book was rendered in a conda environment (`envs/r-conda.yml`, R 4.4 and
+Bioconductor 3.20 packages from conda-forge and Bioconda), and `renv.lock`
+was written from that library with `renv::snapshot()`. Both routes give the
+same package versions; use whichever fits your system.
+:::
+
+## Command-line tools
+
+Chapters [-@sec-strand] and [-@sec-rmats] use HISAT2, samtools, RSeQC,
+featureCounts, sra-tools and rMATS-turbo to build and analyse a small demo
+data set. Their results are stored in `data/demo/`, so you can read and
+render those chapters without installing anything. To rebuild the demo:
+
+```bash
+mamba env create -f envs/ngs.yml
+mamba activate rnaseq-tutorial-ngs
+RSCRIPT=$(which Rscript) bash scripts/make_demo_data.sh
+```
+
+`RSCRIPT` must point to an R installation with the project's packages
+(step 3 of the script uses rtracklayer).
+
+## Rendering the book, and what "freeze" does
+
+```bash
+quarto render
+```
+
+The project uses `freeze: auto` (see `_quarto.yml`). When a chapter is
+executed, Quarto stores its results (printed output and figures) in
+`_freeze/`, which is committed to git. On later renders:
+
+- a chapter whose source has **not** changed is not executed again; its
+  stored results are reused;
+- a chapter whose source **has** changed is executed again.
+
+This is what lets the GitHub Actions workflow publish the book without
+installing R or downloading any data: it only turns the frozen results into
+HTML. To force one chapter to run again, render it on its own, for example
+`quarto render 05-differential-expression.qmd`. When you render a single
+file, Quarto always executes it.
+
+::: {.callout-warning}
+## Frozen results can go stale
+Freeze only watches the `.qmd` file. If you change `R/helpers.R` or a file
+in `results/`, the chapters that use them are not re-run automatically.
+Re-render those chapters yourself, in order, before committing.
+:::
+
+## Habits that make an analysis reproducible
+
+- **Fix the analysis plan first.** Contrast, model, filters and thresholds
+  live in `R/helpers.R` and are set before looking at results.
+- **Record versions.** Of the genome, the annotation and every package.
+  @sec-report shows how they end up in the Methods.
+- **Set seeds** for anything random (`set.seed()` before fgsea and svaseq).
+- **Record where and when data were downloaded.** The data inventory in
+  @sec-design does this.
+- **Keep raw downloads out of git** (`data-cache/` is ignored) but keep small
+  results and frozen outputs in it.
+
+## Session information
+
+The packages loaded to build this chapter:
+
+```{r}
+#| label: session
+sessionInfo()
+```
+
+The complete list of packages used by the book is in `renv.lock`, and
+@sec-report prints the versions of the key packages next to the Methods
+text.
+
+::: {.callout-tip}
+## Check your understanding
+1. You changed a threshold in `R/helpers.R` and ran `quarto render`. Which
+   chapters were updated?
+2. Why is `_freeze/` committed to git while `data-cache/` is not?
+3. What is the difference between `renv.lock` and `envs/ngs.yml`?
+
+::: {.callout-note collapse="true"}
+## Answers
+1. None. Freeze tracks only the `.qmd` files, so the chapters that use the
+   threshold must be re-rendered individually.
+2. `_freeze/` holds small, final outputs needed to publish the book without
+   re-running the analysis. `data-cache/` holds large raw downloads that can
+   be recreated from public sources at any time.
+3. `renv.lock` pins R packages; `envs/ngs.yml` pins the command-line tools
+   (aligner, counters, rMATS) used outside R.
+:::
+:::

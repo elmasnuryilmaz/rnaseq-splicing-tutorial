@@ -1,0 +1,97 @@
+# Preface {.unnumbered}
+
+This book is a hands-on tutorial on two questions that come up in almost
+every RNA-seq project:
+
+1. **Which genes change in expression** between two conditions?
+   (differential expression, DE)
+2. **Which transcripts are spliced differently**, including splicing events
+   that are missing from the reference annotation?
+   (alternative and cryptic splicing)
+
+We answer both questions with one public data set, from the first download
+to the sentence you would write in the Methods section. Every number in the
+book comes from code that you can run yourself.
+
+## The running example
+
+TDP-43 (gene *TARDBP*) is an RNA-binding protein. It is the main component of
+the protein inclusions found in amyotrophic lateral sclerosis (ALS) and in the
+most common pathological form of frontotemporal lobar degeneration
+[@neumann2006], and neurons that carry these inclusions often lose TDP-43
+from the nucleus. One of its nuclear jobs is to keep "cryptic" exons out of
+mature mRNA. These are stretches of intron that
+look enough like exons to be spliced in when TDP-43 is not there to repress
+them [@ling2015]. When TDP-43 is depleted, cryptic exons appear in transcripts
+such as *STMN2* and *UNC13A*
+[@klim2019; @melamed2019; @brown2022; @ma2022].
+
+This makes TDP-43 knockdown a very good teaching case:
+
+- the expected direction of change is known (cryptic exons go **up** when
+  TDP-43 goes **down**), so we can check our methods against a positive
+  control;
+- cryptic exons are, by definition, **not in the annotation**, so they show
+  why annotation-based tools are not enough on their own;
+- the effect on gene expression (for example lower *STMN2*) and the splicing
+  change that causes it can be studied in the same samples.
+
+We use the study by @klim2019, who knocked down TDP-43 with siRNA in motor
+neurons derived from the human embryonic stem cell line HUES3. The data are
+SRA study **SRP166282** (GEO series GSE121569). They are part of
+**recount3** [@wilks2021], which has already aligned every sample to GRCh38
+and summarised it with GENCODE release 26. So we do not need to align a
+single read for the main analysis.
+
+## What you will learn
+
+| Chapter | Topic | Main tools |
+|---|---|---|
+| [-@sec-setup] | Reproducible setup | renv, Quarto, conda |
+| [-@sec-design] | Experimental design and data inventory | recount3 |
+| [-@sec-qc] | Quality control, PCA, batch | DESeq2, limma |
+| [-@sec-strand] | Measuring strandedness | RSeQC, featureCounts, HISAT2 |
+| [-@sec-de] | Differential expression | DESeq2, apeglm, edgeR, sva |
+| [-@sec-viz] | Plots and gene set enrichment | ggplot2, pheatmap, fgsea |
+| [-@sec-cryptic] | Cryptic exons from junction counts | recount3, GenomicFeatures |
+| [-@sec-rmats] | Event-level splicing with rMATS-turbo | rMATS-turbo |
+| [-@sec-report] | Reporting and wording | |
+
+## Analysis standards used throughout
+
+These rules are applied in every chapter and explained where they first
+appear. They are fixed **before** looking at any result.
+
+- One genome (GRCh38) and one annotation (GENCODE v26) for everything.
+  We never mix Ensembl and GENCODE releases in one project.
+- DE: control is set as the reference level explicitly, genes need at least
+  10 counts in at least as many samples as the smallest group, and we report
+  raw and apeglm-shrunken log2 fold changes in separate columns.
+- Thresholds: padj < 0.05 and |log2FC| > 1 for DE; FDR < 0.05 and
+  |ΔPSI| > 0.1 for splicing. Thresholds are never adjusted to the result.
+- Volcano plots use padj, heatmaps use variance-stabilised values with row
+  z-scores, and GSEA always states its ranking metric.
+- Strandedness is measured, not assumed.
+- A cryptic exon claim needs junction read counts **and** a visual check.
+- RNA-seq on its own does not show a change in protein or function. A
+  consistent trend that does not pass FDR is an *exploratory signal*, not a
+  finding.
+
+## How to read this book
+
+Each chapter starts with the question it answers, works through the code,
+and ends with a short **Check your understanding** box. The code is meant to
+be run in order, but every chapter can also be rendered on its own: shared
+helper functions live in `R/helpers.R`, and downloads are cached in
+`data-cache/`.
+
+The source is at
+<https://github.com/elmasnuryilmaz/rnaseq-splicing-tutorial>. Corrections
+and questions are welcome as GitHub issues.
+
+::: {.callout-note}
+## Who this is for
+You should be comfortable with basic R (data frames, functions, `ggplot2`)
+and with the biology of transcription and splicing. You do not need prior
+experience with Bioconductor.
+:::

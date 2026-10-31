@@ -1,0 +1,7 @@
+date: 2026-10-31
+/opt/mm/root/envs/ngs/bin/hisat2-align-s version 2.2.3
+samtools 1.25
+featureCounts v2.1.1
+RSeQC infer_experiment.py infer_experiment.py 5.0.6
+rMATS v4.3.0
+sra-tools 3.4.1

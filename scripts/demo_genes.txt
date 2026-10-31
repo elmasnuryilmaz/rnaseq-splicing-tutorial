@@ -1,0 +1,20 @@
+# Gene panel for the demo BAM files (GENCODE v26 gene names).
+# TDP-43 itself, two housekeeping genes, the literature examples STMN2, UNC13A
+# and POLDIP3, and genes with knockdown-specific junctions in chapter 7.
+TARDBP
+ACTB
+GAPDH
+STMN2
+UNC13A
+POLDIP3
+AGRN
+PFKP
+KCNQ2
+KALRN
+ARHGAP32
+EPB41L4A
+MADD
+ELAVL3
+PXDN
+GRAMD1A
+SLC24A3

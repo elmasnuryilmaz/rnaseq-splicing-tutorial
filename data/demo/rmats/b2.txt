@@ -1,0 +1,1 @@
+work/demo/bam/SRR8083872.bam,work/demo/bam/SRR8083873.bam,work/demo/bam/SRR8083878.bam

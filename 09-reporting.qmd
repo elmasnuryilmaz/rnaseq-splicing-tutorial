@@ -1,0 +1,185 @@
+# Reporting: Methods, wording and claims {#sec-report}
+
+An analysis is only as useful as its description. This chapter turns the
+previous ones into text you could put in a thesis or paper: a Methods
+paragraph with every parameter that matters, results sentences that say
+exactly what the data show, and a checklist that separates **statistically
+significant** from **validated**.
+
+```{r}
+#| label: setup
+source("R/helpers.R")
+suppressPackageStartupMessages(library(dplyr))
+de    <- read.csv("results/de_deseq2_TDP43_vs_scramble.csv")
+cand  <- read.csv("results/cryptic_junction_candidates.csv")
+gsea  <- read.csv("results/gsea_hallmark_TDP43_vs_scramble.csv")
+rmats <- read.csv("results/rmats_demo_significant_JC.csv")
+v <- function(p) as.character(packageVersion(p))
+n_de <- sum(de$DE != "not significant")
+tools <- readLines("data/demo/tool_versions.txt")
+tool_v <- function(pattern) sub("^.*?([0-9]+\\.[0-9.]+).*$", "\\1", grep(pattern, tools, value = TRUE)[1])
+```
+
+## Methods: what to write
+
+Every number below is filled in from the analysis itself, so the text cannot
+drift away from the code.
+
+::: {.callout-note appearance="minimal"}
+**Data.** We reanalysed RNA-seq data of motor neurons differentiated from
+the human embryonic stem cell line HUES3 and transfected with siRNA against
+*TARDBP* (n = 6) or a non-targeting scramble siRNA (n = 6) [@klim2019; SRA
+SRP166282, GEO GSE121569]. Libraries were prepared with the Illumina TruSeq
+RNA kit v2 and sequenced paired-end (2 x 76 bp) in two batches. Gene and
+splice junction counts were obtained from recount3 [@wilks2021] (R package
+recount3 `r v("recount3")`), in which reads were aligned to GRCh38 and
+summarised with GENCODE release 26 [@frankish2019]. GENCODE v26 was used for
+all annotation-based steps. Base-pair coverage sums were converted to read
+counts with `compute_read_counts()`.
+
+**Differential expression.** Genes with at least 10 counts in at least 6
+samples (the size of the smallest group) were kept
+(`r format(nrow(de), big.mark = ",")` genes). Differential expression was
+tested with DESeq2 `r v("DESeq2")` [@love2014] using the design
+`~ batch + condition`, with scramble siRNA as the reference level. Log2 fold
+changes were shrunk with apeglm `r v("apeglm")` [@zhu2019]. Genes with a
+Benjamini-Hochberg adjusted p-value below 0.05 and an absolute shrunken log2
+fold change above 1 were called differentially expressed. Thresholds were
+set before the analysis. Results were compared with edgeR `r v("edgeR")`
+quasi-likelihood F-tests [@chen2016] on the same genes and design. As a
+sensitivity analysis for unrecorded batch effects, surrogate variables were
+estimated with svaseq (sva `r v("sva")`) [@leek2014]; the number of
+surrogate variables was chosen with the permutation method of `num.sv()`.
+
+**Gene set enrichment.** Genes were ranked by the DESeq2 Wald statistic and
+tested against the 50 MSigDB Hallmark gene sets [@liberzon2015] (msigdbr
+`r v("msigdbr")`) with fgsea `r v("fgsea")` [@korotkevich2019] (gene set
+size 15 to 500, random seed 42). Gene sets with adjusted p < 0.05 are
+reported.
+
+**Splice junctions and cryptic exons.** Junctions not matching a GENCODE v26
+intron exactly were considered unannotated. Junction usage was defined as
+the junction's read count divided by the larger of the total counts at its
+donor and at its acceptor site. A junction was a cryptic candidate if it was
+unannotated, had at least 3 reads in at least 4 of 6 knockdown samples, and
+either (A) had at most 2 reads in total in controls and at least 20 in the
+knockdown, or (B) had mean usage below 0.05 in controls and at least 0.1
+higher in the knockdown. Candidates were inspected in sashimi-style plots of
+recount3 coverage and junction counts.
+
+**Event-level splicing (demonstration).** For 3 knockdown and 3 scramble
+samples of batch B2, reads of a predefined panel of 17 genes were aligned to
+GRCh38 with HISAT2 `r tool_v("HISAT")` [@kim2019], keeping properly paired,
+uniquely aligned reads. Strandedness was measured with RSeQC
+infer_experiment [@wang2012] and featureCounts `r tool_v("featureCounts")`
+[@liao2014] and found to be unstranded. Differential splicing was tested
+with rMATS-turbo `r tool_v("rMATS")` [@shen2014; @wang2024]
+(`-t paired --readLength 76 --libType fr-unstranded --novelSS`;
+b1 = knockdown, b2 = scramble, so ΔPSI = PSI(knockdown) - PSI(scramble)).
+Junction-count (JC) results are reported; events were called significant at
+FDR < 0.05, |ΔPSI| > 0.1 and a mean of at least 10 informative reads
+(IJC + SJC) per sample. The FDR refers to the events of the 17-gene panel.
+:::
+
+A few things to notice about this text:
+
+- It names the **replicate unit and n per group**, the **batch handling**,
+  the **reference level**, and the **direction** of every difference.
+- It gives the **annotation release** and genome, and says that one
+  annotation was used throughout.
+- It states **thresholds and when they were fixed**, and the **multiple
+  testing family** (genome-wide for DE, the 17-gene panel for rMATS).
+- It gives **versions** of every package that changes the numbers.
+
+## Results: wording that matches the evidence
+
+Compare these pairs of sentences:
+
+| Overstated | Matches the evidence |
+|---|---|
+| "TDP-43 knockdown downregulates `r n_de` genes." | "`r n_de` genes passed padj < 0.05 and \|log2FC\| > 1 (`r sum(de$DE == "down")` lower and `r sum(de$DE == "up")` higher in the knockdown)." |
+| "STMN2 protein is lost after TDP-43 knockdown." | "*STMN2* mRNA was lower in the knockdown (log2FC `r round(de$log2FC_shrunk[de$symbol == "STMN2"], 2)`, padj `r formatC(de$padj[de$symbol == "STMN2"], format = "e", digits = 1)`)." |
+| "TDP-43 loss induces a cryptic exon in UNC13A." | "Junction reads consistent with the published *UNC13A* cryptic exon were found in knockdown samples only, but at low counts that did not meet our predefined criteria (exploratory signal)." |
+| "The cryptic exon causes nonsense-mediated decay." | "The cryptic exon is not a multiple of three nucleotides and is predicted to introduce a premature termination codon." |
+| "Interferon signalling is activated." | "Hallmark interferon response gene sets were shifted towards higher expression in the knockdown (GSEA, ranking by Wald statistic)." |
+
+## Significant is not the same as validated
+
+These words mean different things and should not be used interchangeably:
+
+- **Statistically significant**: passed a predefined statistical threshold
+  in this data set. It is a statement about the data and the test.
+- **Exploratory signal**: consistent with a hypothesis (for example the
+  expected direction), but did not pass the predefined threshold. Worth
+  following up; not a finding.
+- **Validated**: confirmed by an independent method or independent samples,
+  ideally both. RNA-seq cannot validate itself.
+
+What would validate the claims in this book?
+
+| Claim | Evidence from RNA-seq here | Independent validation |
+|---|---|---|
+| *STMN2* mRNA decreases | DESeq2 and edgeR, padj < 0.05 | RT-qPCR with primers in constitutive exons, in new cultures |
+| *STMN2* cryptic exon appears | Junction counts in 6/6 knockdown samples, coverage plot | RT-PCR or RT-qPCR with a primer spanning the exon 1 to exon 2a junction; second siRNA |
+| STMN2 protein decreases | none | Western blot or immunostaining |
+| Cryptic exon transcript is degraded by NMD | none (sequence prediction only) | Block NMD (cycloheximide or UPF1 knockdown) and measure the cryptic isoform |
+| Effect is caused by TDP-43 loss, not by the siRNA sequence | one siRNA only | Second independent siRNA or rescue with siRNA-resistant TDP-43 |
+| Pathway "activation" | GSEA on mRNA | Functional assay of the pathway |
+
+## A checklist for every reported result
+
+For each number that leaves your analysis, you should be able to state:
+
+- [ ] data set ID and number of samples per group;
+- [ ] genome and annotation release;
+- [ ] the statistical test, the threshold, and when it was fixed;
+- [ ] the multiple-testing family (genome-wide, gene set, gene panel);
+- [ ] direction of the comparison (which group is the reference);
+- [ ] software versions and analysis date;
+- [ ] whether the result is significant, exploratory or validated.
+
+## Software versions
+
+```{r}
+#| label: versions
+pkgs <- c("DESeq2", "apeglm", "edgeR", "limma", "sva", "fgsea", "msigdbr",
+          "recount3", "GenomicFeatures", "rtracklayer", "SummarizedExperiment")
+data.frame(package = pkgs, version = vapply(pkgs, v, character(1))) |>
+  knitr::kable(row.names = FALSE)
+```
+
+Command-line tools used for the demo data (`data/demo/tool_versions.txt`):
+
+```{r}
+#| label: tool-versions
+cat(tools, sep = "\n")
+```
+
+```{r}
+#| label: session
+sessionInfo()
+```
+
+::: {.callout-tip}
+## Check your understanding
+1. Rewrite "TDP-43 regulates `r n_de` genes" so that it matches the evidence.
+2. Why does the rMATS paragraph mention the 17-gene panel?
+3. A result has padj = 0.08 and the expected direction. How do you describe
+   it?
+4. What is the minimum additional experiment that would let you write that
+   a cryptic exon is "validated"?
+
+::: {.callout-note collapse="true"}
+## Answers
+1. For example: "After TDP-43 knockdown, `r n_de` genes passed padj < 0.05 and
+   |log2FC| > 1 compared with scramble siRNA (DESeq2, n = 6 per group)."
+   "Regulates" implies direct, causal control, which RNA-seq after
+   knockdown cannot show.
+2. Because the FDR was computed over the events in those genes only. A
+   reader must know the multiple-testing family to interpret the FDR.
+3. As an exploratory signal: consistent in direction, not significant at
+   the predefined threshold.
+4. An independent measurement of the junction, typically RT-PCR or RT-qPCR
+   with a junction-spanning primer, in independent samples.
+:::
+:::

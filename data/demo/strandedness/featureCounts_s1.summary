@@ -1,0 +1,15 @@
+Status	work/demo/bam/SRR8083874.bam	work/demo/bam/SRR8083875.bam	work/demo/bam/SRR8083880.bam	work/demo/bam/SRR8083872.bam	work/demo/bam/SRR8083873.bam	work/demo/bam/SRR8083878.bam
+Assigned	93955	75664	64638	124931	90343	86920
+Unassigned_Unmapped	0	0	0	0	0	0
+Unassigned_Read_Type	0	0	0	0	0	0
+Unassigned_Singleton	0	0	0	0	0	0
+Unassigned_MappingQuality	0	0	0	0	0	0
+Unassigned_Chimera	0	0	0	0	0	0
+Unassigned_FragmentLength	0	0	0	0	0	0
+Unassigned_Duplicate	0	0	0	0	0	0
+Unassigned_MultiMapping	0	0	0	0	0	0
+Unassigned_Secondary	0	0	0	0	0	0
+Unassigned_NonSplit	0	0	0	0	0	0
+Unassigned_NoFeatures	92137	76896	63724	119494	86105	83254
+Unassigned_Overlapping_Length	0	0	0	0	0	0
+Unassigned_Ambiguity	0	0	0	0	0	0

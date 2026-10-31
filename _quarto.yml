@@ -1,0 +1,54 @@
+project:
+  type: book
+  output-dir: _book
+
+execute:
+  # Re-run a chapter only when its source changes. Rendered results live in
+  # _freeze/ (committed), so CI only converts frozen output to HTML.
+  freeze: auto
+
+book:
+  title: "From counts to cryptic exons"
+  subtitle: "A hands-on tutorial on differential expression and alternative splicing with public RNA-seq data"
+  author: "Elmasnur Yılmaz"
+  date: last-modified
+  date-format: "D MMMM YYYY"
+  repo-url: https://github.com/elmasnuryilmaz/rnaseq-splicing-tutorial
+  repo-actions: [source, issue]
+  search: true
+  page-footer: "Text and figures © 2026 Elmasnur Yılmaz, [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/). Code: MIT."
+  chapters:
+    - index.qmd
+    - 01-setup.qmd
+    - 02-design.qmd
+    - 03-qc.qmd
+    - 04-strandedness.qmd
+    - 05-differential-expression.qmd
+    - 06-visualisation-gsea.qmd
+    - 07-cryptic-exons.qmd
+    - 08-rmats.qmd
+    - 09-reporting.qmd
+    - references.qmd
+
+bibliography: references.bib
+
+format:
+  html:
+    theme:
+      light: [cosmo, custom.scss]
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    code-copy: true
+    code-overflow: wrap
+    fig-format: png
+    fig-dpi: 110
+    df-print: kable
+    link-external-newwindow: true
+
+knitr:
+  opts_chunk:
+    message: false
+    warning: false
+    fig.align: center
+    comment: "#>"

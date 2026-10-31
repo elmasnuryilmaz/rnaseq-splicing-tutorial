@@ -1,0 +1,283 @@
+# Experimental design and data inventory {#sec-design}
+
+Before any statistics, we need to know exactly what was measured. In this
+chapter we download the study from recount3, build a clean sample sheet, and
+answer five questions that decide every later step:
+
+1. Which samples and groups are there?
+2. What is the biological replicate?
+3. Is there a batch structure, and is it confounded with the groups?
+4. What kind of library is it (paired or single, read length, strandedness)?
+5. Which genome and annotation were used to produce the counts?
+
+```{r}
+#| label: setup
+source("R/helpers.R")
+suppressPackageStartupMessages({
+  library(recount3)
+  library(dplyr)
+})
+```
+
+## Finding the study in recount3
+
+recount3 [@wilks2021] has processed more than 8,000 human SRA studies with
+the same pipeline (Monorail, which aligns with STAR) and made gene, exon and
+junction counts available for each of them. `available_projects()` lists
+them all; we keep the one we need.
+
+```{r}
+#| label: find-project
+proj <- recount3_project()
+proj
+```
+
+`create_rse()` downloads the gene-level counts and the sample metadata and
+returns a `RangedSummarizedExperiment`: a matrix of counts (genes in rows,
+sequencing runs in columns) bundled with gene annotation (`rowData`) and
+sample information (`colData`). `load_gene_rse()` in `R/helpers.R` calls it
+once and caches the result.
+
+```{r}
+#| label: load-rse
+rse <- load_gene_rse()
+rse
+```
+
+## What the submitters told us
+
+SRA metadata are free text written by the submitters, so it is worth reading
+them before trusting any automatic parsing.
+
+```{r}
+#| label: study-text
+cd <- colData(rse)
+cat(strwrap(unique(cd$sra.study_title), 80), sep = "\n")
+cat(strwrap(unique(cd$sra.library_construction_protocol), 80), sep = "\n")
+```
+
+The sample attributes are stored as `key;;value` pairs. Here is one sample:
+
+```{r}
+#| label: attributes
+cd$sra.sample_attributes[1]
+```
+
+`sample_table()` turns these strings into a tidy sample sheet.
+
+```{r}
+#| label: sample-sheet
+samples <- sample_table(rse)
+samples |>
+  select(run, gsm, title, sirna, batch, date, read_pairs, mapped_pairs, unique_pct) |>
+  knitr::kable(row.names = FALSE)
+```
+
+```{r}
+#| label: save-sample-sheet
+dir.create("results", showWarnings = FALSE)
+write.csv(samples, "results/sample_sheet.csv", row.names = FALSE)
+```
+
+## Groups and batches
+
+```{r}
+#| label: design-table
+with(samples, table(siRNA = sirna, batch = batch))
+```
+
+There are four groups. TDP-43 siRNA is the treatment. Three kinds of control
+were sequenced:
+
+- **scramble siRNA**: a non-targeting siRNA delivered the same way. This is
+  the right control for the knockdown, because it has the same transfection
+  and the same exposure to an siRNA, and differs only in the target sequence.
+- **fluorescent siRNA**: a labelled non-targeting siRNA, typically used to
+  monitor transfection.
+- **no siRNA**: untransfected cells.
+
+::: {.callout-important}
+## Our main contrast
+All differential analyses in this book compare **TDP-43 siRNA (n = 6)**
+against **scramble siRNA (n = 6)**. The two other controls are used in
+@sec-qc to check that transfection itself did not change the transcriptome
+more than the knockdown did. Choosing the contrast before seeing any result
+is part of the analysis plan, not a detail.
+:::
+
+The submitters recorded two dates, which we treat as two batches
+(B1: 2013-01-10, B2: 2013-06-10). The read names in the SRA files agree:
+the first read of every run carries its flow cell ID, and the B1 runs we
+checked were sequenced on flow cell `D245NACXX` while the B2 runs were on
+`H0T47ADXX` or `H0T1LADXX`.
+
+```bash
+# First read name of one B1 run and one B2 run (sra-tools, streamed from AWS)
+fastq-dump -X 1 -Z https://sra-pub-run-odp.s3.amazonaws.com/sra/SRR8083865/SRR8083865 | head -1
+#> @SRR8083865.1 D245NACXX130417:3:1111:5807:75955 length=152
+fastq-dump -X 1 -Z https://sra-pub-run-odp.s3.amazonaws.com/sra/SRR8083872/SRR8083872 | head -1
+#> @SRR8083872.1 H0T47ADXX130625:2:1201:14704:28078 length=152
+```
+
+Both groups
+of the main contrast are present in both batches (2 + 2 in B1, 4 + 4 in B2).
+That matters a lot:
+
+- If batch and condition were **confounded** (for example all knockdowns in
+  B1 and all scrambles in B2), no statistical model could separate the
+  knockdown effect from the batch effect.
+- Because the design is **balanced**, we can estimate the batch effect from
+  the data and remove it from the comparison by adding `batch` to the model
+  (`~ batch + condition`, @sec-de).
+
+## What is the biological replicate?
+
+The *replicate* is the unit that is independently exposed to the treatment.
+It decides what our p-values mean. From the metadata:
+
+- All 18 samples come from **one cell line** (HUES3), differentiated into
+  motor neurons.
+- Total RNA was extracted from "d10 MNs" grown in 24-well cultures
+  (protocol text above).
+- Replicates are numbered rep1 to rep6 within each siRNA group, and each
+  has its own GEO sample (GSM) and library.
+
+So a replicate here is a separately treated culture of the same cell line,
+processed in one of two batches. The metadata do not say whether the
+cultures came from separate differentiations; the paper's Methods are the
+place to check this before you publish anything based on these data. Two consequences follow:
+
+1. Our statistics describe variability **between cultures of one cell line
+   under this protocol**. They do not describe variability between people.
+   A gene that responds to TDP-43 knockdown here may or may not respond in
+   neurons from other donors.
+2. If several "replicates" came from the same differentiation, they are not
+   fully independent, and the p-values will be somewhat optimistic. This is
+   a limitation to state in the report, not something we can fix in software.
+
+::: {.callout-tip}
+Write down the replicate unit before you open the count matrix. For patient
+samples it is the person; for pseudobulk single-cell data it is the donor,
+never the cell; for cell lines it is the independent culture or
+differentiation.
+:::
+
+## Library type
+
+```{r}
+#| label: library
+cd <- colData(rse)
+data.frame(
+  layout    = unique(cd$sra.library_layout),
+  platform  = unique(cd$sra.platform_model),
+  read_info = unique(gsub("count:[0-9]+,", "", cd$sra.read_info))
+)
+```
+
+- **Paired-end**, two reads (index 0 and index 1) of **76 bp** per fragment.
+  This read length is what rMATS needs in @sec-rmats.
+- **Kit**: Illumina TruSeq RNA v2, a poly(A)-selection kit. As far as we
+  know from the kit name it is *not* strand-specific, but a kit name in a
+  metadata field is a claim, not a measurement. @sec-strand measures it.
+- **Depth**: between `r round(min(samples$read_pairs) / 1e6, 1)` and
+  `r round(max(samples$read_pairs) / 1e6, 1)` million read pairs per run,
+  with more than `r floor(min(samples$unique_pct))`% uniquely mapped in every
+  sample.
+
+## Reference and annotation
+
+```{r}
+#| label: annotation
+metadata(rse)$annotation
+table(rowData(rse)$gene_type) |> sort(decreasing = TRUE) |> head(8)
+```
+
+recount3 aligned all reads to **GRCh38** and summarised gene counts with
+**GENCODE release 26**. We use the same release everywhere in this book: for
+the gene counts, for deciding whether a splice junction is annotated
+(@sec-cryptic), and for the small alignment demo and rMATS run
+(@sec-strand, @sec-rmats). Gene identifiers carry a version suffix
+(`ENSG00000120948.15` for *TARDBP*), which is a quick way to check that two
+tables come from the same release.
+
+::: {.callout-warning}
+## One annotation per project
+GENCODE v26 corresponds to Ensembl 88. Gene models, gene IDs and even gene
+symbols change between releases. If counts come from one release and the
+junction or splicing annotation from another, "novel" junctions may only be
+novel to the older release, and gene IDs may fail to match. Pick one release
+and write it in the Methods.
+:::
+
+## From coverage to read counts
+
+recount3 does not count reads directly. It stores the **sum of base-level
+coverage** over each gene. To get numbers that behave like read counts,
+divide by the average mapped read length. For paired-end data that length
+covers both mates, so the result is close to a count of fragments.
+
+```{r}
+#| label: counts
+assay(rse, "counts") <- compute_read_counts(rse)
+counts_per_sample <- colSums(assay(rse, "counts"))
+summary(counts_per_sample / samples[colnames(rse), "mapped_pairs"])
+```
+
+The gene counts add up to 84% to 93% of the mapped fragments, as expected,
+because some fragments fall in introns, between genes, or on more than one
+gene.
+
+::: {.callout-warning}
+## Do not use `transform_counts()` for DESeq2
+recount3 also offers `transform_counts()`, which by default rescales every
+sample to the same total (40 million 100 bp reads). That is handy for
+browsing, but it removes the real differences in library size that DESeq2
+and edgeR need to model. For differential analysis, use
+`compute_read_counts()` and let the DE method normalise.
+:::
+
+```{r}
+#| label: cache-counts
+saveRDS(rse, cache_path("rse_gene_counts.rds"))
+```
+
+## Data inventory
+
+| Item | Value |
+|---|---|
+| Study | SRA SRP166282, GEO GSE121569 [@klim2019] |
+| Cells | HUES3 human embryonic stem cells differentiated into motor neurons |
+| Groups used | TDP-43 siRNA (6), scramble siRNA (6); QC only: fluorescent siRNA (3), no siRNA (3) |
+| Replicate unit | separately treated culture of one cell line (see text) |
+| Batches | B1 (2013-01-10), B2 (2013-06-10), balanced across groups |
+| Library | TruSeq RNA v2 (poly(A)), paired-end 2 x 76 bp, Illumina HiSeq 2000 |
+| Strandedness | measured in @sec-strand |
+| Genome / annotation | GRCh38 / GENCODE v26 (recount3 code G026) |
+| Source of counts | recount3 gene and junction files, AWS Open Data mirror |
+| Downloaded | `r format(Sys.Date())` |
+
+::: {.callout-tip}
+## Check your understanding
+1. Why is scramble siRNA, and not "no siRNA", the right control for the
+   knockdown?
+2. Imagine all knockdown samples had been sequenced in B1 and all scramble
+   samples in B2. What could you still conclude?
+3. A colleague says "we have 6 replicates, so our result holds for human
+   motor neurons". What is wrong with that sentence?
+4. Why should you not feed the output of `transform_counts()` to DESeq2?
+
+::: {.callout-note collapse="true"}
+## Answers
+1. Scramble siRNA controls for transfection and for the presence of an
+   siRNA. Only the target sequence differs, so the difference can be
+   attributed to loss of TDP-43.
+2. Almost nothing about the knockdown: any difference could be batch.
+   Confounding cannot be fixed by modelling; it has to be avoided at the
+   design stage.
+3. The six replicates are cultures of one cell line. They capture
+   culture-to-culture variability, not variability between people.
+4. It rescales every sample to the same total, which hides real library
+   size differences and distorts the mean-variance relationship that DESeq2
+   models. Use `compute_read_counts()` instead.
+:::
+:::

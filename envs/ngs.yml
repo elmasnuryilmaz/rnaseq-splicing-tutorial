@@ -1,0 +1,14 @@
+# Command-line tools for the demo data (chapters 4 and 8).
+# Create with:  mamba env create -f envs/ngs.yml
+name: rnaseq-tutorial-ngs
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - python=3.11
+  - hisat2=2.2.3
+  - samtools=1.25
+  - subread=2.1.1        # featureCounts
+  - rseqc=5.0.6          # infer_experiment.py
+  - sra-tools=3.4.1      # fastq-dump
+  - rmats=4.3.0          # rMATS-turbo

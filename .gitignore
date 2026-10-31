@@ -1,0 +1,24 @@
+# Rendered book (built in CI)
+_book/
+/.quarto/
+*_files/
+
+# Large downloaded data (recreated by the chapters)
+data-cache/
+work/
+
+# R / renv
+.Rhistory
+.RData
+.Rproj.user/
+renv/library/
+renv/staging/
+renv/local/
+renv/cellar/
+renv/python/
+renv/sandbox/
+
+# OS
+.DS_Store
+
+**/*.quarto_ipynb

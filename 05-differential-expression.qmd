@@ -1,0 +1,375 @@
+# Differential expression with DESeq2 and edgeR {#sec-de}
+
+We now ask which genes change in expression when TDP-43 is knocked down. The
+main tool is DESeq2 [@love2014]; edgeR's quasi-likelihood pipeline
+[@robinson2010; @chen2016] serves as a second method that is often preferred
+for small sample sizes. At the end we look at what happens if the batch had
+not been recorded, using surrogate variable analysis [@leek2014].
+
+```{r}
+#| label: setup
+source("R/helpers.R")
+suppressPackageStartupMessages({
+  library(DESeq2)
+  library(edgeR)
+  library(sva)
+  library(dplyr)
+  library(ggplot2)
+})
+fmt_p <- function(x) formatC(x, format = "e", digits = 1)
+```
+
+## The comparison
+
+From @sec-design and @sec-qc we take three decisions:
+
+- **Samples**: TDP-43 siRNA (n = 6) versus scramble siRNA (n = 6).
+- **Model**: `~ batch + condition`, because batch is the largest source of
+  variation and is balanced across groups.
+- **Reference level**: scramble, so that positive log2 fold changes mean
+  *higher in the knockdown*.
+
+```{r}
+#| label: subset
+rse <- load_counts_rse()
+rse <- rse[, rse$sirna %in% c("scramble", "TDP43")]
+rse$condition <- droplevels(rse$sirna)
+rse$batch <- droplevels(rse$batch)
+table(condition = rse$condition, batch = rse$batch)
+```
+
+## Setting the reference level explicitly
+
+R orders factor levels alphabetically unless told otherwise. Here that would
+happen to give the right answer ("scramble" before "TDP43"), but relying on
+alphabetical order is fragile: name the groups "WT" and "KD" and the
+knockdown silently becomes the reference, flipping the sign of every fold
+change. We therefore always set the
+reference with `relevel()`.
+
+```{r}
+#| label: relevel
+rse$condition <- relevel(factor(rse$condition), ref = "scramble")
+levels(rse$condition)
+```
+
+## Filtering low counts
+
+Genes with very few reads carry almost no information and add to the
+multiple-testing burden. Our rule: **at least 10 counts in at least as many
+samples as the smallest group** (here 6). The rule ignores the group labels,
+so it cannot bias the test towards one group.
+
+```{r}
+#| label: dds
+dds <- DESeqDataSet(rse, design = ~ batch + condition)
+min_group <- min(table(dds$condition))
+keep <- rowSums(counts(dds) >= 10) >= min_group
+dds <- dds[keep, ]
+c(smallest_group = min_group, genes_tested = nrow(dds))
+```
+
+## Fitting the model
+
+`DESeq()` estimates size factors (library size normalisation), fits one
+dispersion per gene with shrinkage towards a trend, and fits a negative
+binomial GLM for each gene.
+
+```{r}
+#| label: deseq
+dds <- DESeq(dds)
+resultsNames(dds)
+```
+
+```{r}
+#| label: fig-dispersion
+#| fig-cap: "Dispersion estimates. Black: per-gene estimates; red: fitted trend; blue: final shrunken estimates. Circled points are outliers kept at their own estimate."
+#| fig-width: 5.5
+#| fig-height: 4.5
+plotDispEsts(dds)
+```
+
+The dispersion plot is a quick health check: estimates should scatter around
+a smooth decreasing trend, as they do here.
+
+## Results: raw and shrunken fold changes
+
+`results()` gives the maximum likelihood log2 fold change, its standard
+error, and a Wald test p-value adjusted for multiple testing with the
+Benjamini-Hochberg method (padj).
+
+For genes with few counts, the raw log2 fold change can be very large simply
+because of noise. `lfcShrink()` with the apeglm prior [@zhu2019] pulls noisy
+estimates towards zero while leaving well-supported large effects almost
+untouched. We use the **shrunken** values for ranking and plots, and keep
+the **raw** values in the table as well, in separate, clearly named columns.
+
+```{r}
+#| label: results
+coef_name <- "condition_TDP43_vs_scramble"
+res <- results(dds, name = coef_name, alpha = DE_PADJ)
+res_shr <- lfcShrink(dds, coef = coef_name, type = "apeglm", quiet = TRUE)
+summary(res)
+```
+
+```{r}
+#| label: result-table
+de <- data.frame(
+  gene_id        = rownames(res),
+  symbol         = rowData(dds)$gene_name,
+  gene_type      = rowData(dds)$gene_type,
+  baseMean       = res$baseMean,
+  log2FC         = res$log2FoldChange,      # raw (MLE)
+  lfcSE          = res$lfcSE,               # raw (MLE)
+  log2FC_shrunk  = res_shr$log2FoldChange,  # apeglm
+  lfcSE_shrunk   = res_shr$lfcSE,           # apeglm
+  stat           = res$stat,
+  pvalue         = res$pvalue,
+  padj           = res$padj
+) |>
+  arrange(padj)
+```
+
+## Calling differentially expressed genes
+
+Our predefined thresholds are **padj < 0.05** and **|log2FC| > 1**. We apply
+the fold change cut-off to the shrunken estimate, so that a gene cannot pass
+only because its raw fold change is inflated by noise.
+
+```{r}
+#| label: call-de
+de <- de |>
+  mutate(DE = case_when(
+    !is.na(padj) & padj < DE_PADJ & log2FC_shrunk >  DE_LFC ~ "up",
+    !is.na(padj) & padj < DE_PADJ & log2FC_shrunk < -DE_LFC ~ "down",
+    TRUE ~ "not significant"))
+table(de$DE)
+```
+
+```{r}
+#| label: top-table
+de |>
+  filter(DE != "not significant") |>
+  slice_head(n = 15) |>
+  mutate(across(c(baseMean, log2FC, lfcSE, log2FC_shrunk, lfcSE_shrunk), \(x) round(x, 2)),
+         across(c(pvalue, padj), fmt_p)) |>
+  select(gene_id, symbol, baseMean, log2FC, lfcSE, log2FC_shrunk, pvalue, padj, DE) |>
+  knitr::kable(row.names = FALSE)
+```
+
+Of the `r sum(de$padj < DE_PADJ, na.rm = TRUE)` genes with padj < 0.05, only
+`r sum(de$DE != "not significant")` also change more than two-fold. Most
+responses to a partial TDP-43 knockdown are modest, which is why the fold
+change threshold has to be fixed in advance: a slightly different cut-off
+would change the list a lot, and choosing it after seeing the result would
+make the list meaningless.
+
+*TARDBP* itself should be among the most significant genes, and it is. Next
+to it in the table are two other GENCODE v26 genes annotated on top of the
+*TARDBP* locus: RP4-635E18.9, whose exons overlap *TARDBP*, and RP4-635E18.8,
+just downstream of it. recount3 counts a read for every gene whose exons it
+covers, so genes that share sequence with the siRNA target drop together with
+it. They are not independent findings. *STMN2* is
+also strongly reduced, while *UNC13A* and *POLDIP3* do not change at the gene
+level. For *UNC13A* that is not evidence against a splicing effect; we come
+back to it in @sec-cryptic.
+
+```{r}
+#| label: known-genes
+de |>
+  filter(symbol %in% c("TARDBP", "STMN2", "UNC13A", "POLDIP3")) |>
+  mutate(across(c(baseMean, log2FC, log2FC_shrunk), \(x) round(x, 2)),
+         across(c(pvalue, padj), fmt_p)) |>
+  select(symbol, baseMean, log2FC, log2FC_shrunk, padj, DE) |>
+  knitr::kable(row.names = FALSE)
+```
+
+::: {.callout-note}
+## A formal test against a fold change threshold
+Filtering on |log2FC| after testing against zero is common practice, but the
+padj then refers to "any change", not to "a change larger than 2-fold". If
+you need the latter, DESeq2 can test it directly with
+`results(dds, lfcThreshold = 1)`. Here this gives
+`r sum(results(dds, name = coef_name, lfcThreshold = 1, alpha = DE_PADJ)$padj < DE_PADJ, na.rm = TRUE)`
+genes, compared with `r sum(de$DE != "not significant")` from the filter
+approach. Report which approach you used.
+:::
+
+```{r}
+#| label: save
+write.csv(de, "results/de_deseq2_TDP43_vs_scramble.csv", row.names = FALSE)
+saveRDS(dds, cache_path("dds_TDP43_vs_scramble.rds"))
+write.csv(as.data.frame(counts(dds, normalized = TRUE)) |>
+            tibble::rownames_to_column("gene_id"),
+          gzfile(cache_path("normalized_counts.csv.gz")), row.names = FALSE)
+```
+
+The full table is saved as `results/de_deseq2_TDP43_vs_scramble.csv`.
+
+## edgeR quasi-likelihood: a second opinion
+
+With only a handful of replicates per group, the quasi-likelihood (QL)
+F-test in edgeR is a good alternative: it accounts for the uncertainty in
+estimating each gene's dispersion and tends to be conservative. We use the
+same genes and the same design so that the two methods can be compared
+directly.
+
+```{r}
+#| label: edger
+y <- DGEList(counts = counts(dds), samples = as.data.frame(colData(dds)[, c("condition", "batch")]))
+y <- normLibSizes(y)                               # TMM normalisation
+design <- model.matrix(~ batch + condition, data = y$samples)
+fit <- glmQLFit(y, design)
+qlf <- glmQLFTest(fit, coef = "conditionTDP43")
+et <- topTags(qlf, n = Inf, sort.by = "none")$table
+edger <- data.frame(gene_id = rownames(et), logFC = et$logFC, PValue = et$PValue, FDR = et$FDR)
+edger$DE <- with(edger, ifelse(FDR < DE_PADJ & abs(logFC) > DE_LFC,
+                               ifelse(logFC > 0, "up", "down"), "not significant"))
+table(edger$DE)
+```
+
+```{r}
+#| label: compare-methods
+cmp <- inner_join(de, edger, by = "gene_id", suffix = c(".deseq2", ".edger"))
+sig_d <- cmp$gene_id[cmp$DE.deseq2 != "not significant"]
+sig_e <- cmp$gene_id[cmp$DE.edger  != "not significant"]
+both <- intersect(sig_d, sig_e)
+data.frame(
+  DESeq2_only = length(setdiff(sig_d, sig_e)),
+  both        = length(both),
+  edgeR_only  = length(setdiff(sig_e, sig_d)),
+  same_direction_in_both = mean(sign(cmp$log2FC[cmp$gene_id %in% both]) ==
+                                sign(cmp$logFC[cmp$gene_id %in% both])),
+  spearman_logFC_all_genes = cor(cmp$log2FC, cmp$logFC, method = "spearman")
+)
+```
+
+Both methods call largely the same genes
+(`r length(both)` shared, `r length(setdiff(sig_d, sig_e))` DESeq2 only,
+`r length(setdiff(sig_e, sig_d))` edgeR only), every shared gene changes in
+the same direction, and the fold changes of all tested genes are almost
+perfectly rank-correlated. edgeR calls more genes here mainly because we
+applied the fold change cut-off to the *shrunken* DESeq2 estimate but to the
+unshrunken edgeR estimate. Genes called by only one method sit close to a
+threshold in both; they are a reminder that a cut-off is a convention, not a
+property of the gene.
+
+## What if the batch had not been recorded?
+
+Suppose the dates were missing from the metadata. PCA would still show two
+clusters of samples, but we would not know why. Surrogate variable analysis
+(svaseq) estimates hidden factors from the data, and these can be added to
+the model in place of the unknown batch.
+
+Two rules apply whenever you use it:
+
+1. **Report the number of surrogate variables (SVs)** and how it was chosen.
+2. **Report a sensitivity check**: how many genes pass the thresholds with
+   and without the SVs, how many overlap, and whether the direction agrees.
+
+```{r}
+#| label: svaseq
+dds_nobatch <- DESeqDataSet(rse[rownames(dds), ], design = ~ condition)
+dds_nobatch <- estimateSizeFactors(dds_nobatch)
+norm_counts <- counts(dds_nobatch, normalized = TRUE)
+mod  <- model.matrix(~ condition, colData(dds_nobatch))
+mod0 <- model.matrix(~ 1, colData(dds_nobatch))
+n_sv <- num.sv(log2(norm_counts + 1), mod, method = "be", seed = 1)
+set.seed(1)
+sv <- svaseq(norm_counts, mod, mod0, n.sv = n_sv)$sv
+colnames(sv) <- paste0("SV", seq_len(ncol(sv)))
+n_sv
+```
+
+The permutation-based method ("be") suggests `r n_sv` surrogate
+variable(s). Does the first one recover the batch we hid?
+
+```{r}
+#| label: sv-vs-batch
+round(cor(sv, as.numeric(dds_nobatch$batch == "B2")), 2)
+```
+
+Now fit three models on the same genes and compare them.
+
+```{r}
+#| label: sva-sensitivity
+fit_calls <- function(d) {
+  d <- DESeq(d, quiet = TRUE)
+  cf <- "condition_TDP43_vs_scramble"
+  r <- results(d, name = cf, alpha = DE_PADJ)
+  s <- lfcShrink(d, coef = cf, type = "apeglm", quiet = TRUE)
+  data.frame(gene_id = rownames(r), lfc = s$log2FoldChange, padj = r$padj,
+             sig = !is.na(r$padj) & r$padj < DE_PADJ & abs(s$log2FoldChange) > DE_LFC)
+}
+colData(dds_nobatch) <- cbind(colData(dds_nobatch), sv)
+sv_formula <- as.formula(paste("~", paste(colnames(sv), collapse = " + "), "+ condition"))
+models <- list(
+  batch_known = de |> transmute(gene_id, lfc = log2FC_shrunk, padj,
+                                sig = DE != "not significant"),
+  no_adjustment = fit_calls(DESeqDataSet(rse[rownames(dds), ], design = ~ condition)),
+  svaseq = fit_calls(DESeqDataSet(SummarizedExperiment(
+    assays = list(counts = counts(dds_nobatch)), colData = colData(dds_nobatch)),
+    design = sv_formula))
+)
+ref <- models$batch_known
+sens <- lapply(names(models), function(m) {
+  x <- inner_join(ref, models[[m]], by = "gene_id", suffix = c(".ref", ".m"))
+  shared <- x$sig.ref & x$sig.m
+  data.frame(model = m,
+             genes_passing = sum(x$sig.m),
+             overlap_with_batch_model = sum(shared),
+             same_direction = if (any(shared)) mean(sign(x$lfc.ref[shared]) == sign(x$lfc.m[shared])) else NA)
+})
+do.call(rbind, sens) |> knitr::kable(row.names = FALSE)
+```
+
+How to read this table:
+
+- **no_adjustment** ignores the batch completely. Because batch was the
+  largest source of variation, leaving it out inflates the residual
+  variance, so only `r sens[[2]]$genes_passing` genes pass, all of them also
+  found by the batch model.
+- **svaseq** used `r n_sv` surrogate variables. The first one is almost the
+  hidden batch (correlation `r round(cor(sv[, 1], as.numeric(dds_nobatch$batch == "B2")), 2)`).
+  It finds `r sens[[3]]$genes_passing` genes, of which
+  `r sens[[3]]$overlap_with_batch_model` are shared with the known-batch
+  model, all with the same direction. These three numbers (genes passing,
+  overlap, direction agreement) are the sensitivity check you report.
+- The `r sens[[3]]$genes_passing - sens[[3]]$overlap_with_batch_model`
+  genes found only with SVs are not "extra discoveries". They show that
+  the SVs also absorb some variation that is not batch, which changes the
+  result at the margin.
+
+::: {.callout-warning}
+## When not to use SVA
+If the batch is known, model it directly, as we did. Surrogate variables can
+absorb part of the biological signal when the hidden factor is correlated
+with the condition, and they make the model harder to explain. SVA is a
+tool for unknown structure, not a replacement for recording your batches.
+:::
+
+::: {.callout-tip}
+## Check your understanding
+1. What would change in the results table if you forgot `relevel()` and the
+   groups were named "WT" and "KD"?
+2. Why do we apply the |log2FC| cut-off to the shrunken rather than the raw
+   fold change?
+3. The filter keeps genes with at least 10 counts in at least 6 samples. Why
+   6, and why is this filter not biased towards either group?
+4. You used svaseq and found 3 SVs. What else must you report?
+
+::: {.callout-note collapse="true"}
+## Answers
+1. "KD" sorts before "WT", so the knockdown would become the reference and
+   every log2 fold change would flip sign, with no warning. `relevel()`
+   removes the dependency on spelling.
+2. Raw fold changes of low-count genes are noisy and can be large by chance.
+   Shrinkage keeps large, well-supported effects and pulls noisy ones towards
+   zero, so the cut-off selects genes with reliable large effects.
+3. 6 is the size of the smallest group, so a gene expressed in only one group
+   can still pass. The rule does not look at group labels, so it is
+   independent of the test statistic under the null hypothesis.
+4. How the number was chosen, and a sensitivity analysis: genes passing with
+   and without SVs, their overlap, and the direction agreement.
+:::
+:::
